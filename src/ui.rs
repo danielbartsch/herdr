@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::Span,
     Frame,
 };
@@ -94,9 +94,13 @@ const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 /// entry whose name (or branch) was truncated to fit the column. Shows the full
 /// text — one line per row of the hovered entry (e.g. space name + branch).
 pub(crate) struct HoverTooltip {
-    /// Full, untruncated lines to display. The first line is the primary label;
-    /// any following lines (e.g. a branch) are rendered dimmer beneath it.
-    pub lines: Vec<String>,
+    /// Full, untruncated lines to display, each paired with the exact style it
+    /// is rendered with in the sidebar (so the box matches the truncated text's
+    /// color and weight).
+    pub lines: Vec<(String, Style)>,
+    /// Background of the hovered row, so the box preserves it (e.g. a selected
+    /// space keeps its brighter background instead of resetting to default).
+    pub bg: Color,
     /// Screen row the first line should align to.
     pub row: u16,
     /// Screen column where the truncated text begins.
@@ -113,54 +117,52 @@ fn sidebar_hover_tooltip_allowed(mode: Mode) -> bool {
 }
 
 /// Paint the hover tooltip as a floating bordered box over the rest of the UI.
-fn render_hover_tooltip(app: &AppState, frame: &mut Frame, tooltip: &HoverTooltip) {
+fn render_hover_tooltip(_app: &AppState, frame: &mut Frame, tooltip: &HoverTooltip) {
     use ratatui::text::Line;
-    use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+    use ratatui::widgets::{Block, Clear, Paragraph};
     use unicode_width::UnicodeWidthStr;
 
     let area = frame.area();
-    if tooltip.lines.is_empty() || area.width < 4 || area.height < 3 {
+    if tooltip.lines.is_empty() || area.width < 3 || area.height < 1 {
         return;
     }
-    let p = &app.palette;
 
-    // Box width = widest padded line (" text ") plus the two border columns,
-    // clamped to the screen. The tooltip may overflow the sidebar into the panes
-    // — that is intentional, it paints over whatever sits beneath it.
+    // Box width = widest padded line (" text ", one space each side), clamped to
+    // the screen. The tooltip may overflow the sidebar into the panes — that is
+    // intentional, it paints over whatever sits beneath it.
     let text_w = tooltip
         .lines
         .iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()) as u16)
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()) as u16)
         .max()
         .unwrap_or(0);
-    let box_w = (text_w + 4).min(area.width);
-    let box_h = (tooltip.lines.len() as u16 + 2).min(area.height);
+    let box_w = (text_w + 2).min(area.width);
+    let box_h = (tooltip.lines.len() as u16).min(area.height);
 
-    // Align the inner text with the hovered row, shifting the box up by one for
-    // the top border. Clamp so the box stays fully on screen.
+    // Align the first line directly with the hovered row, and the text (after
+    // its one-space pad) with the hovered column. Clamp so it stays on screen.
     let max_x = area.x + area.width - box_w;
-    let x = tooltip.col.saturating_sub(2).clamp(area.x, max_x);
+    let x = tooltip.col.saturating_sub(1).clamp(area.x, max_x);
     let max_y = area.y + area.height - box_h;
-    let y = tooltip.row.saturating_sub(1).clamp(area.y, max_y);
+    let y = tooltip.row.clamp(area.y, max_y);
     let rect = Rect::new(x, y, box_w, box_h);
 
+    // Each line keeps the exact style it has in the sidebar, so the expanded
+    // text matches the truncated version's color and weight.
     let lines: Vec<Line> = tooltip
         .lines
         .iter()
-        .enumerate()
-        .map(|(idx, text)| {
-            // First line is the primary label; later lines (e.g. branch) dimmer.
-            let color = if idx == 0 { p.text } else { p.overlay0 };
-            Line::from(Span::styled(format!(" {text} "), Style::default().fg(color)))
-        })
+        .map(|(text, style)| Line::from(Span::styled(format!(" {text} "), *style)))
         .collect();
 
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(p.accent))
-        .style(Style::default().bg(p.panel_bg));
+    // Fill with the hovered row's own background so hovering never changes it:
+    // an unselected space keeps the default background, a selected one keeps its
+    // brighter background. Clear first to blank any underlying pane glyphs.
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(lines).block(block), rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().style(Style::default().bg(tooltip.bg))),
+        rect,
+    );
 }
 
 // Braille spinner frames — smooth rotation

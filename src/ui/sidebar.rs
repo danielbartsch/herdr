@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -906,14 +906,20 @@ fn render_workspace_list(
         let highlighted = selected || is_active || is_dragged;
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
 
+        // The row's background — reused for the highlight fill and the hover
+        // tooltip so hovering preserves whatever background the row already has.
+        let card_bg = if selected {
+            p.surface0
+        } else if is_dragged {
+            p.surface1
+        } else if is_active {
+            p.surface_dim
+        } else {
+            Color::Reset
+        };
+
         if highlighted {
-            let bg = if selected {
-                p.surface0
-            } else if is_dragged {
-                p.surface1
-            } else {
-                p.surface_dim
-            };
+            let bg = card_bg;
             let buf = frame.buffer_mut();
             for y in row_y..row_y + row_height {
                 if y >= list_bottom {
@@ -974,7 +980,7 @@ fn render_workspace_list(
         // whether it was truncated. A name-only tooltip is emitted now; the
         // branch block below upgrades it to a combined name + branch tooltip so
         // a single hover expands the whole card.
-        let mut hovered_name: Option<(String, bool, u16)> = None;
+        let mut hovered_name: Option<(String, Style, bool, u16)> = None;
         if let Some((mx, my)) = app.last_mouse_pos {
             let over_card = mx >= card.rect.x
                 && mx < card.rect.x + card.rect.width
@@ -993,12 +999,13 @@ fn render_workspace_list(
                     let name_col = card.rect.x + prefix_width as u16;
                     if truncated {
                         *hover_tooltip = Some(HoverTooltip {
-                            lines: vec![name.to_string()],
+                            lines: vec![(name.to_string(), name_style)],
+                            bg: card_bg,
                             row: row_y,
                             col: name_col,
                         });
                     }
-                    hovered_name = Some((name.to_string(), truncated, name_col));
+                    hovered_name = Some((name.to_string(), name_style, truncated, name_col));
                 }
             }
         }
@@ -1039,15 +1046,20 @@ fn render_workspace_list(
                 } else {
                     p.overlay0
                 };
+                let branch_style = Style::default().fg(branch_color);
                 let branch_indent = if card.indented { "     " } else { "   " };
 
                 // When the card is hovered, expand the whole card into one
-                // tooltip: full name plus full branch. Shown whenever either the
-                // name or the branch was truncated.
-                if let Some((full_name, name_truncated, name_col)) = &hovered_name {
+                // tooltip: full name plus full branch. Each line keeps its own
+                // sidebar style. Shown whenever the name or the branch was cut.
+                if let Some((full_name, name_style, name_truncated, name_col)) = &hovered_name {
                     if *name_truncated || branch_truncated {
                         *hover_tooltip = Some(HoverTooltip {
-                            lines: vec![full_name.clone(), full_branch],
+                            lines: vec![
+                                (full_name.clone(), *name_style),
+                                (full_branch, branch_style),
+                            ],
+                            bg: card_bg,
                             row: row_y,
                             col: *name_col,
                         });
@@ -1219,7 +1231,8 @@ fn render_agent_detail(
             if let Some((mx, my)) = app.last_mouse_pos {
                 if my == row_y && mx >= body.x && mx < body.x + body.width {
                     *hover_tooltip = Some(HoverTooltip {
-                        lines: vec![primary_full],
+                        lines: vec![(primary_full, name_style)],
+                        bg: if is_active { p.surface_dim } else { Color::Reset },
                         row: row_y,
                         col: name_col,
                     });
