@@ -195,6 +195,8 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.state.last_mouse_pos = Some((mouse.column, mouse.row));
+
         if self.handle_overlay_mouse(mouse) {
             return;
         }

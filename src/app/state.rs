@@ -1299,6 +1299,9 @@ pub struct AppState {
     pub mobile_switcher_scroll: usize,
     // View geometry (computed before render, consumed by render + mouse)
     pub view: ViewState,
+    /// Last known mouse position (screen column, row), updated on every mouse
+    /// event. Used to render hover tooltips for truncated sidebar labels.
+    pub last_mouse_pos: Option<(u16, u16)>,
     pub(crate) drag: Option<DragState>,
     pub(crate) workspace_press: Option<WorkspacePressState>,
     pub(crate) tab_press: Option<TabPressState>,
@@ -1636,6 +1639,7 @@ impl AppState {
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
             },
+            last_mouse_pos: None,
             drag: None,
             workspace_press: None,
             tab_press: None,

@@ -90,6 +90,79 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
+/// A floating label rendered on top of the UI when the mouse hovers a sidebar
+/// entry whose name (or branch) was truncated to fit the column. Shows the full
+/// text — one line per row of the hovered entry (e.g. space name + branch).
+pub(crate) struct HoverTooltip {
+    /// Full, untruncated lines to display. The first line is the primary label;
+    /// any following lines (e.g. a branch) are rendered dimmer beneath it.
+    pub lines: Vec<String>,
+    /// Screen row the first line should align to.
+    pub row: u16,
+    /// Screen column where the truncated text begins.
+    pub col: u16,
+}
+
+/// Modes in which the expanded sidebar is the foreground interaction surface, so
+/// a hover tooltip should be allowed to paint over the rest of the UI.
+fn sidebar_hover_tooltip_allowed(mode: Mode) -> bool {
+    matches!(
+        mode,
+        Mode::Terminal | Mode::Navigate | Mode::Resize | Mode::Prefix | Mode::Copy
+    )
+}
+
+/// Paint the hover tooltip as a floating bordered box over the rest of the UI.
+fn render_hover_tooltip(app: &AppState, frame: &mut Frame, tooltip: &HoverTooltip) {
+    use ratatui::text::Line;
+    use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+    use unicode_width::UnicodeWidthStr;
+
+    let area = frame.area();
+    if tooltip.lines.is_empty() || area.width < 4 || area.height < 3 {
+        return;
+    }
+    let p = &app.palette;
+
+    // Box width = widest padded line (" text ") plus the two border columns,
+    // clamped to the screen. The tooltip may overflow the sidebar into the panes
+    // — that is intentional, it paints over whatever sits beneath it.
+    let text_w = tooltip
+        .lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()) as u16)
+        .max()
+        .unwrap_or(0);
+    let box_w = (text_w + 4).min(area.width);
+    let box_h = (tooltip.lines.len() as u16 + 2).min(area.height);
+
+    // Align the inner text with the hovered row, shifting the box up by one for
+    // the top border. Clamp so the box stays fully on screen.
+    let max_x = area.x + area.width - box_w;
+    let x = tooltip.col.saturating_sub(2).clamp(area.x, max_x);
+    let max_y = area.y + area.height - box_h;
+    let y = tooltip.row.saturating_sub(1).clamp(area.y, max_y);
+    let rect = Rect::new(x, y, box_w, box_h);
+
+    let lines: Vec<Line> = tooltip
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(idx, text)| {
+            // First line is the primary label; later lines (e.g. branch) dimmer.
+            let color = if idx == 0 { p.text } else { p.overlay0 };
+            Line::from(Span::styled(format!(" {text} "), Style::default().fg(color)))
+        })
+        .collect();
+
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.panel_bg));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -367,12 +440,22 @@ pub fn render_with_runtime_registry(
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
+    // Collected while rendering the sidebar: the full name of a truncated entry
+    // currently under the mouse, so we can paint an expanded tooltip on top.
+    let mut hover_tooltip: Option<HoverTooltip> = None;
+
     if app.view.layout == ViewLayout::Mobile {
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
     } else if app.sidebar_collapsed {
         render_sidebar_collapsed(app, frame, sidebar_area);
     } else {
-        render_sidebar(app, terminal_runtimes, frame, sidebar_area);
+        render_sidebar(
+            app,
+            terminal_runtimes,
+            frame,
+            sidebar_area,
+            &mut hover_tooltip,
+        );
     }
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
@@ -410,6 +493,13 @@ pub fn render_with_runtime_registry(
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
+    }
+
+    // Painted last so the expanded name sits on top of every other element.
+    if let Some(tooltip) = hover_tooltip {
+        if sidebar_hover_tooltip_allowed(app.mode) {
+            render_hover_tooltip(app, frame, &tooltip);
+        }
     }
 }
 
@@ -831,6 +921,192 @@ mod tests {
         assert_eq!(line2, "   main");
 
         std::fs::remove_dir_all(repo).ok();
+    }
+
+    #[test]
+    fn hovering_truncated_space_name_paints_full_name_tooltip() {
+        let long_name = "long name that will not be shown completely";
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("ws");
+        ws.set_custom_name(long_name.to_string());
+        app.workspaces = vec![ws];
+        app.selected = 0;
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let card = app.view.workspace_card_areas[0].rect;
+
+        // Without a hover the truncated name never shows in full.
+        let render_rows = |app: &AppState| {
+            let backend = TestBackend::new(80, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(app, frame)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..20)
+                .map(|row| {
+                    (0..80)
+                        .map(|x| buffer[(x, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        app.last_mouse_pos = None;
+        assert!(
+            !render_rows(&app).iter().any(|line| line.contains(long_name)),
+            "full name should be hidden without a hover"
+        );
+
+        // Hovering the card paints the full name as a tooltip that overflows the
+        // sidebar into the pane area.
+        app.last_mouse_pos = Some((card.x + 1, card.y));
+        let rows = render_rows(&app);
+        assert!(
+            rows.iter().any(|line| line.contains(long_name)),
+            "full name should be painted on hover, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn hovering_truncated_branch_paints_full_branch_tooltip() {
+        let long_branch = "feature/a-really-long-branch-name-that-will-not-fit";
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("ws");
+        ws.set_custom_name("ws".to_string());
+        ws.cached_git_branch = Some(long_branch.to_string());
+        app.workspaces = vec![ws];
+        app.selected = 0;
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let card = app.view.workspace_card_areas[0].rect;
+        assert!(card.height > 1, "card should have a branch row");
+
+        let render_rows = |app: &AppState| {
+            let backend = TestBackend::new(80, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(app, frame)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..20)
+                .map(|row| {
+                    (0..80)
+                        .map(|x| buffer[(x, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        app.last_mouse_pos = None;
+        assert!(
+            !render_rows(&app)
+                .iter()
+                .any(|line| line.contains(long_branch)),
+            "full branch should be hidden without a hover"
+        );
+
+        // Hovering the name row (not the branch row) still expands the branch:
+        // one hover anywhere on the card expands the whole card.
+        app.last_mouse_pos = Some((card.x + 1, card.y));
+        let rows = render_rows(&app);
+        assert!(
+            rows.iter().any(|line| line.contains(long_branch)),
+            "full branch should be painted when hovering the name row, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn hovering_card_expands_both_name_and_branch_together() {
+        let long_name = "storybook component collection that overflows";
+        let long_branch = "feature/another-really-long-branch-name-here";
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("ws");
+        ws.set_custom_name(long_name.to_string());
+        ws.cached_git_branch = Some(long_branch.to_string());
+        app.workspaces = vec![ws];
+        app.selected = 0;
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let card = app.view.workspace_card_areas[0].rect;
+        app.last_mouse_pos = Some((card.x + 1, card.y));
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..20)
+            .map(|row| (0..80).map(|x| buffer[(x, row)].symbol()).collect())
+            .collect();
+
+        assert!(
+            rows.iter().any(|line| line.contains(long_name)),
+            "full name should be painted, rows: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|line| line.contains(long_branch)),
+            "full branch should be painted, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn hovering_truncated_agent_name_paints_full_name_tooltip() {
+        let long_name = "long agent name that will not be shown completely";
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("ws");
+        ws.set_custom_name(long_name.to_string());
+        let root_pane = ws.tabs[0].root_pane;
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        let root_terminal_id = app.workspaces[0].tabs[0].panes[&root_pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&root_terminal_id)
+            .unwrap()
+            .detected_agent = Some(crate::detect::Agent::Claude);
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 30));
+
+        let (_, detail_area) =
+            expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+        let metrics = agent_panel_scroll_metrics(&app, detail_area);
+        let body = agent_panel_body_rect(detail_area, should_show_scrollbar(metrics));
+        assert!(body != Rect::default(), "agent panel body should render");
+
+        let render_rows = |app: &AppState| {
+            let backend = TestBackend::new(80, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(app, frame)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..30)
+                .map(|row| {
+                    (0..80)
+                        .map(|x| buffer[(x, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        app.last_mouse_pos = None;
+        assert!(
+            !render_rows(&app).iter().any(|line| line.contains(long_name)),
+            "full agent name should be hidden without a hover"
+        );
+
+        // Hover the first agent name row.
+        app.last_mouse_pos = Some((body.x + 3, body.y));
+        let rows = render_rows(&app);
+        assert!(
+            rows.iter().any(|line| line.contains(long_name)),
+            "full agent name should be painted on hover, rows: {rows:?}"
+        );
     }
 
     #[test]

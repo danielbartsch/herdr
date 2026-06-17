@@ -468,6 +468,7 @@ impl App {
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
             },
+            last_mouse_pos: None,
             drag: None,
             workspace_press: None,
             tab_press: None,

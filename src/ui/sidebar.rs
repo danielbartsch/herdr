@@ -6,8 +6,11 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{agent_icon, state_dot, state_label, state_label_color};
+use super::HoverTooltip;
 use crate::app::state::{AgentPanelScope, Palette};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
@@ -207,6 +210,15 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     }
     let prefix: String = text.chars().take(max_width.saturating_sub(1)).collect();
     format!("{prefix}…")
+}
+
+/// The full, untruncated primary label for an agent panel entry, matching the
+/// composition `format_agent_panel_primary_label` produces when nothing is cut.
+fn agent_panel_full_label(entry: &AgentPanelEntry) -> String {
+    match entry.primary_tab_label.as_deref() {
+        Some(tab_label) => format!("{} · {}", entry.primary_label, tab_label),
+        None => entry.primary_label.clone(),
+    }
 }
 
 fn format_agent_panel_primary_label(entry: &AgentPanelEntry, max_width: usize) -> String {
@@ -814,6 +826,7 @@ pub(super) fn render_sidebar(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
     area: Rect,
+    hover_tooltip: &mut Option<HoverTooltip>,
 ) {
     let p = &app.palette;
     let is_navigating = matches!(app.mode, Mode::Navigate);
@@ -832,8 +845,15 @@ pub(super) fn render_sidebar(
 
     let (ws_area, detail_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
 
-    render_workspace_list(app, terminal_runtimes, frame, ws_area, is_navigating);
-    render_agent_detail(app, terminal_runtimes, frame, detail_area);
+    render_workspace_list(
+        app,
+        terminal_runtimes,
+        frame,
+        ws_area,
+        is_navigating,
+        hover_tooltip,
+    );
+    render_agent_detail(app, terminal_runtimes, frame, detail_area, hover_tooltip);
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
@@ -843,6 +863,7 @@ fn render_workspace_list(
     frame: &mut Frame,
     area: Rect,
     is_navigating: bool,
+    hover_tooltip: &mut Option<HoverTooltip>,
 ) {
     let p = &app.palette;
     let dragged_ws_idx = match app.drag.as_ref().map(|drag| &drag.target) {
@@ -949,6 +970,39 @@ fn render_workspace_list(
             line1.push(Span::styled(label, name_style));
         }
 
+        // If the mouse hovers anywhere on this card, capture the full name and
+        // whether it was truncated. A name-only tooltip is emitted now; the
+        // branch block below upgrades it to a combined name + branch tooltip so
+        // a single hover expands the whole card.
+        let mut hovered_name: Option<(String, bool, u16)> = None;
+        if let Some((mx, my)) = app.last_mouse_pos {
+            let over_card = mx >= card.rect.x
+                && mx < card.rect.x + card.rect.width
+                && my >= row_y
+                && my < row_y + row_height;
+            if over_card {
+                if let Some((name, prefix_width)) = line1.split_last().map(|(name, prefix)| {
+                    let prefix_width: usize = prefix
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                        .sum();
+                    (name.content.as_ref(), prefix_width)
+                }) {
+                    let available = (card.rect.width as usize).saturating_sub(prefix_width);
+                    let truncated = UnicodeWidthStr::width(name) > available;
+                    let name_col = card.rect.x + prefix_width as u16;
+                    if truncated {
+                        *hover_tooltip = Some(HoverTooltip {
+                            lines: vec![name.to_string()],
+                            row: row_y,
+                            col: name_col,
+                        });
+                    }
+                    hovered_name = Some((name.to_string(), truncated, name_col));
+                }
+            }
+        }
+
         frame.render_widget(
             Paragraph::new(Line::from(line1)),
             Rect::new(card.rect.x, row_y, card.rect.width, 1),
@@ -973,7 +1027,9 @@ fn render_workspace_list(
                     })
                     .unwrap_or(0);
                 let max_branch_len = (card.rect.width as usize).saturating_sub(5 + reserved);
-                let branch_display = if branch.len() > max_branch_len {
+                let branch_truncated = branch.len() > max_branch_len;
+                let full_branch = branch.clone();
+                let branch_display = if branch_truncated {
                     format!("{}…", &branch[..max_branch_len.saturating_sub(1)])
                 } else {
                     branch
@@ -984,6 +1040,19 @@ fn render_workspace_list(
                     p.overlay0
                 };
                 let branch_indent = if card.indented { "     " } else { "   " };
+
+                // When the card is hovered, expand the whole card into one
+                // tooltip: full name plus full branch. Shown whenever either the
+                // name or the branch was truncated.
+                if let Some((full_name, name_truncated, name_col)) = &hovered_name {
+                    if *name_truncated || branch_truncated {
+                        *hover_tooltip = Some(HoverTooltip {
+                            lines: vec![full_name.clone(), full_branch],
+                            row: row_y,
+                            col: *name_col,
+                        });
+                    }
+                }
                 let mut spans = vec![
                     Span::styled(branch_indent, Style::default()),
                     Span::styled(branch_display, Style::default().fg(branch_color)),
@@ -1051,6 +1120,7 @@ fn render_agent_detail(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
     area: Rect,
+    hover_tooltip: &mut Option<HoverTooltip>,
 ) {
     let p = &app.palette;
 
@@ -1129,6 +1199,10 @@ fn render_agent_detail(
 
         let primary_label =
             format_agent_panel_primary_label(detail, body.width.saturating_sub(3) as usize);
+        let primary_full = agent_panel_full_label(detail);
+        let primary_truncated = primary_full != primary_label;
+        // " " + icon + " " precede the name (icon is single-width).
+        let name_col = body.x.saturating_add(3);
         let name_line = Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled(icon, icon_style),
@@ -1139,6 +1213,20 @@ fn render_agent_detail(
             Paragraph::new(name_line).style(row_style),
             Rect::new(body.x, row_y, body.width, 1),
         );
+
+        // Hovering the entry's name row reveals the full name when truncated.
+        if primary_truncated {
+            if let Some((mx, my)) = app.last_mouse_pos {
+                if my == row_y && mx >= body.x && mx < body.x + body.width {
+                    *hover_tooltip = Some(HoverTooltip {
+                        lines: vec![primary_full],
+                        row: row_y,
+                        col: name_col,
+                    });
+                }
+            }
+        }
+
         row_y += 1;
 
         let mut status_spans = vec![
