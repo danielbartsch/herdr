@@ -5540,6 +5540,58 @@ next_tab = ""
         );
     }
 
+    #[tokio::test]
+    async fn enter_keypress_reaches_pane_exactly_once_through_full_pipeline() {
+        // Defense-in-depth for the "Enter/Backspace fire twice" class of bug:
+        // even if a key release reaches the server (e.g. a terminal that reports
+        // event types), the dispatch layer must drop it. Drive a press plus a
+        // CSI-u release through the real client→server→route_client_events→pane
+        // pipeline and assert exactly one keystroke reaches the pane's pty.
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 8);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        // Enter press (legacy CR), then Enter release (kitty CSI-u, event type 3).
+        let _ = server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"\r".to_vec(),
+        });
+        let _ = server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"\x1b[13;1:3u".to_vec(),
+        });
+
+        let mut forwarded = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            forwarded.extend_from_slice(&bytes);
+        }
+        assert_eq!(
+            forwarded, b"\r",
+            "one Enter keystroke (press + release) must reach the pane exactly once, got {forwarded:?}"
+        );
+    }
+
     #[test]
     fn render_and_stream_uses_each_client_terminal_size() {
         let mut server = test_headless_server();

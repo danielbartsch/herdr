@@ -4,10 +4,16 @@
     .fingerprint = 0x67c0c059de921c4f,
     .dependencies = .{
         // google/wuffs
+        //
+        // Vendored locally as `./upstream` (only `release/c/wuffs-v0.4.c`, the
+        // single amalgamation file this package actually compiles) instead of
+        // fetching the full upstream tarball. The tarball ships deliberately
+        // malformed image fixtures under `test/` that an on-access antivirus
+        // (Bitdefender) flags and blocks reads of, breaking the build. None of
+        // those fixtures are used here. See vendor_libghostty_vt.py, which
+        // re-applies this on every re-vendor.
         .wuffs = .{
-            .url = "https://deps.files.ghostty.org/wuffs-122037b39d577ec2db3fd7b2130e7b69ef6cc1807d68607a7c232c958315d381b5cd.tar.gz",
-            .hash = "N-V-__8AAAzZywE3s51XfsLbP9eyEw57ae9swYB9aGB6fCMs",
-            .lazy = true,
+            .path = "upstream",
         },
 
         // make-github-pseudonymous-again/pixels

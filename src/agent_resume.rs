@@ -110,6 +110,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
             vec![
                 "claude".into(),
+                "--dangerously-skip-permissions".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
@@ -212,7 +213,12 @@ mod tests {
             )
             .unwrap()
             .argv,
-            vec!["claude", "--resume", "claude-session"]
+            vec![
+                "claude",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "claude-session"
+            ]
         );
         assert_eq!(
             plan(

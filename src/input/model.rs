@@ -45,8 +45,15 @@ impl From<KeyEvent> for TerminalKey {
 
 #[cfg(not(windows))]
 pub fn ime_compatible_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    // Deliberately NOT requesting REPORT_EVENT_TYPES. herdr discards key-release
+    // events anyway, and asking the outer terminal for event types makes some
+    // terminals (notably Alacritty) report the *release* of legacy keys
+    // (Backspace `\x7f`, Enter `\r`) as a duplicate of the bare legacy byte
+    // instead of a CSI-u `...:3u` sequence. herdr cannot tell that duplicate
+    // apart from a genuine second press, so it forwarded both and Backspace /
+    // Enter fired twice inside panes. DISAMBIGUATE_ESCAPE_CODES (Esc/IME
+    // disambiguation) and REPORT_ALTERNATE_KEYS are what we actually rely on.
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
@@ -147,8 +154,12 @@ mod tests {
         let flags = ime_compatible_keyboard_enhancement_flags();
 
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        // Must NOT request event types: it makes Alacritty (and similar
+        // terminals) report legacy-key releases as duplicate bare bytes,
+        // doubling Backspace and Enter in panes. herdr drops releases anyway.
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        // Must NOT request report-all-keys: it breaks IME text input.
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 
