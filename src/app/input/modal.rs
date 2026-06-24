@@ -194,9 +194,7 @@ pub(crate) fn handle_navigator_key(
             KeyCode::Char(c)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
-                state.navigator.state_filter = None;
-                state.navigator.query.push(c);
-                state.clamp_navigator_selection_from(terminal_runtimes);
+                insert_navigator_search_text(state, terminal_runtimes, &c.to_string());
             }
             _ => {}
         }
@@ -281,6 +279,19 @@ pub(crate) fn handle_navigator_key(
         }
         _ => {}
     }
+}
+
+pub(crate) fn insert_navigator_search_text(
+    state: &mut AppState,
+    terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    text: &str,
+) {
+    if !state.navigator.search_focused {
+        return;
+    }
+    state.navigator.state_filter = None;
+    state.navigator.query.push_str(text);
+    state.clamp_navigator_selection_from(terminal_runtimes);
 }
 
 pub(crate) fn handle_keybind_help_key(state: &mut AppState, key: KeyEvent) {
@@ -442,12 +453,25 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                         if let Some(ws) = state.workspaces.get_mut(ws_idx) {
                             let workspace_id = ws.id.clone();
                             let active_tab = ws.active_tab;
+                            let keep_auto_name = ws
+                                .tabs
+                                .get(active_tab)
+                                .is_some_and(|tab| tab.is_auto_named())
+                                && ws
+                                    .tab_display_name(active_tab)
+                                    .is_some_and(|name| new_name == name);
                             if let Some(tab) = ws.active_tab_mut() {
-                                let keep_auto_name =
-                                    tab.is_auto_named() && new_name == tab.number.to_string();
                                 if !new_name.is_empty() && !keep_auto_name {
                                     tab.set_custom_name(new_name);
-                                    let tab_id = format!("{}:{}", workspace_id, active_tab + 1);
+                                    let tab_id = ws
+                                        .public_tab_number(active_tab)
+                                        .map(|number| {
+                                            crate::workspace::public_tab_id_for_number(
+                                                &workspace_id,
+                                                number,
+                                            )
+                                        })
+                                        .unwrap_or_else(|| workspace_id.clone());
                                     crate::logging::tab_renamed(&workspace_id, &tab_id);
                                     state.mark_session_dirty();
                                 }
@@ -496,6 +520,13 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
 fn clear_rename_input(state: &mut AppState) {
     state.name_input.clear();
     state.name_input_replace_on_type = false;
+}
+
+pub(crate) fn insert_rename_input_text(state: &mut AppState, text: &str) {
+    if state.name_input_replace_on_type {
+        clear_rename_input(state);
+    }
+    state.name_input.push_str(text);
 }
 
 fn delete_rename_input_char(state: &mut AppState) {
@@ -578,10 +609,7 @@ pub(crate) fn handle_rename_key(state: &mut AppState, key: KeyEvent) {
         }
         KeyCode::Backspace => delete_rename_input_char(state),
         KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
-            if state.name_input_replace_on_type {
-                clear_rename_input(state);
-            }
-            state.name_input.push(c);
+            insert_rename_input_text(state, &c.to_string());
         }
         _ => {}
     }
@@ -1094,6 +1122,23 @@ mod tests {
     }
 
     #[test]
+    fn rename_modal_replaces_prefilled_text_on_paste() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::RenameTab;
+        state.name_input = "2".into();
+        state.name_input_replace_on_type = true;
+
+        insert_rename_input_text(&mut state, "feature/logs");
+
+        assert_eq!(state.name_input, "feature/logs");
+        assert!(!state.name_input_replace_on_type);
+
+        insert_rename_input_text(&mut state, "-copy");
+
+        assert_eq!(state.name_input, "feature/logs-copy");
+    }
+
+    #[test]
     fn rename_modal_handles_line_editing_shortcuts() {
         let mut state = state_with_workspaces(&["test"]);
         state.mode = Mode::RenameWorkspace;
@@ -1166,6 +1211,32 @@ mod tests {
     }
 
     #[test]
+    fn navigator_search_accepts_pasted_text_when_focused() {
+        let mut state = state_with_workspaces(&["alpha", "beta"]);
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        state.mode = Mode::Navigator;
+        state.navigator.search_focused = true;
+        state.navigator.state_filter = Some(NavigatorStateFilter::Working);
+
+        insert_navigator_search_text(&mut state, &terminal_runtimes, "beta");
+
+        assert_eq!(state.navigator.query, "beta");
+        assert_eq!(state.navigator.state_filter, None);
+    }
+
+    #[test]
+    fn navigator_search_ignores_paste_when_search_is_not_focused() {
+        let mut state = state_with_workspaces(&["alpha", "beta"]);
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        state.mode = Mode::Navigator;
+        state.navigator.search_focused = false;
+
+        insert_navigator_search_text(&mut state, &terminal_runtimes, "beta");
+
+        assert!(state.navigator.query.is_empty());
+    }
+
+    #[test]
     fn open_rename_active_tab_can_prefill_default_new_tab_name() {
         let mut state = state_with_workspaces(&["test"]);
         state.workspaces[0].test_add_tab(None);
@@ -1230,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_first_auto_tab_resets_remaining_auto_tab_and_next_prompt() {
+    fn closing_first_auto_tab_compacts_remaining_auto_tab_label_and_next_prompt() {
         let mut state = state_with_workspaces(&["test"]);
         open_new_tab_dialog(&mut state);
         handle_rename_key(
@@ -1245,7 +1316,10 @@ mod tests {
         state.workspaces[0].close_tab(0);
         state.workspaces[0].switch_tab(0);
 
-        assert_eq!(state.workspaces[0].tabs[0].display_name(), "1");
+        assert_eq!(
+            state.workspaces[0].tab_display_name(0).as_deref(),
+            Some("1")
+        );
         assert!(state.workspaces[0].tabs[0].custom_name.is_none());
 
         open_new_tab_dialog(&mut state);
@@ -1266,7 +1340,10 @@ mod tests {
 
         assert_eq!(state.mode, Mode::Terminal);
         assert!(state.workspaces[0].tabs[1].custom_name.is_none());
-        assert_eq!(state.workspaces[0].tabs[1].display_name(), "2");
+        assert_eq!(
+            state.workspaces[0].tab_display_name(1).as_deref(),
+            Some("2")
+        );
     }
 
     #[test]

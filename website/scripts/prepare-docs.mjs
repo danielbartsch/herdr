@@ -26,6 +26,7 @@ async function preparePublicAssets() {
   for (const file of [
     'install.sh',
     'install.ps1',
+    'agent-guide.md',
     'latest.json',
     'preview.json',
     'robots.txt',
@@ -40,7 +41,7 @@ async function preparePublicAssets() {
     }
   }
 
-  for (const directory of ['assets', 'css']) {
+  for (const directory of ['assets', 'css', 'agent-detection']) {
     await cp(resolve(repoRoot, 'website', directory), resolve(publicDir, directory), {
       recursive: true,
     });

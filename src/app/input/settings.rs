@@ -100,7 +100,13 @@ fn preview_selected_theme(state: &mut AppState) {
     use crate::app::state::Palette;
 
     let name = THEME_NAMES[state.settings.list.selected];
-    if let Some(palette) = Palette::from_name(name) {
+    if let Some(mut palette) = Palette::from_name(name) {
+        if let Some(custom) = &state.theme_runtime.custom {
+            palette = palette.with_overrides(custom);
+        }
+        if let Some(accent) = &state.theme_runtime.legacy_accent {
+            palette.accent = crate::config::parse_color(accent);
+        }
         state.palette = palette;
         state.theme_name = name.to_string();
     }
@@ -297,6 +303,7 @@ pub(crate) fn open_settings(state: &mut AppState) {
 }
 
 pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
+    state.integration_install_messages.clear();
     state.settings.original_palette = Some(state.palette.clone());
     state.settings.original_theme = Some(state.theme_name.clone());
     state.settings.section = section;
@@ -313,7 +320,12 @@ pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
 
 impl AppState {
     fn settings_popup_rect(&self) -> Rect {
-        crate::ui::centered_popup_rect(self.screen_rect(), 76, 22).unwrap_or_default()
+        crate::ui::centered_popup_rect(
+            self.screen_rect(),
+            crate::ui::SETTINGS_POPUP_WIDTH,
+            crate::ui::settings_popup_height(self),
+        )
+        .unwrap_or_default()
     }
 
     fn settings_inner_rect(&self) -> Rect {
@@ -603,6 +615,12 @@ mod tests {
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
         );
         assert_eq!(state.settings.section, SettingsSection::Integrations);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
+        );
+        assert_eq!(state.settings.section, SettingsSection::PaneLabels);
     }
 
     #[test]

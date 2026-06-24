@@ -147,7 +147,13 @@ function Test-FileDigest {
         return
     }
 
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $actual = [System.BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
     if ($actual -ne $ExpectedDigest.ToLowerInvariant()) {
         throw "Downloaded Herdr checksum did not match. Expected $ExpectedDigest but got $actual."
     }
@@ -196,7 +202,8 @@ function Set-ManagedJunction {
     param(
         [string]$LinkPath,
         [string]$TargetPath,
-        [string]$ManagedTargetPrefix
+        [string]$ManagedTargetPrefix,
+        [bool]$AllowLegacyHerdrBinMigration = $false
     )
 
     if (Test-Path -LiteralPath $LinkPath) {
@@ -212,12 +219,15 @@ function Set-ManagedJunction {
             if ($existingTarget.Equals($TargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
                 return
             }
-            Remove-Item -LiteralPath $LinkPath -Force
+            Remove-Item -LiteralPath $LinkPath -Recurse -Force
         } elseif ($item.PSIsContainer) {
             if ((Get-ChildItem -LiteralPath $LinkPath -Force | Select-Object -First 1) -ne $null) {
-                throw "Refusing to replace non-empty directory at $LinkPath with a junction."
+                if (-not (Move-LegacyHerdrBinDirectory -Path $LinkPath -AllowMigration $AllowLegacyHerdrBinMigration)) {
+                    throw "Refusing to replace non-empty directory at $LinkPath with a junction."
+                }
+            } else {
+                Remove-Item -LiteralPath $LinkPath -Recurse -Force
             }
-            Remove-Item -LiteralPath $LinkPath -Force
         } else {
             throw "Refusing to replace file at $LinkPath with a junction."
         }
@@ -225,6 +235,31 @@ function Set-ManagedJunction {
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LinkPath) | Out-Null
     New-Item -ItemType Junction -Path $LinkPath -Target $TargetPath | Out-Null
+}
+
+function Move-LegacyHerdrBinDirectory {
+    param(
+        [string]$Path,
+        [bool]$AllowMigration
+    )
+
+    if (-not $AllowMigration) {
+        return $false
+    }
+
+    $entries = @(Get-ChildItem -LiteralPath $Path -Force)
+    if (($entries | Where-Object { $_.PSIsContainer } | Select-Object -First 1) -ne $null) {
+        return $false
+    }
+
+    if (($entries | Where-Object { $_.Name -ieq "herdr.exe" } | Select-Object -First 1) -eq $null) {
+        return $false
+    }
+
+    $legacyPath = "$Path.legacy.$([System.Guid]::NewGuid().ToString("N"))"
+    Move-Item -LiteralPath $Path -Destination $legacyPath
+    Write-Step "Moved legacy Herdr bin directory to $legacyPath."
+    return $true
 }
 
 function Remove-StaleInstallArtifacts {
@@ -396,6 +431,15 @@ $visibleBinDir = if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 } else {
     $InstallDir
 }
+$allowLegacyVisibleBinMigration = $false
+try {
+    $allowLegacyVisibleBinMigration = [System.IO.Path]::GetFullPath($visibleBinDir).TrimEnd("\").Equals(
+        [System.IO.Path]::GetFullPath($defaultVisibleBinDir).TrimEnd("\"),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+} catch {
+    $allowLegacyVisibleBinMigration = $false
+}
 
 $existingHerdr = Get-HerdrCommandSource
 if (-not [string]::IsNullOrWhiteSpace($existingHerdr) -and -not (Test-PathStartsWith -Path $existingHerdr -Prefix $visibleBinDir)) {
@@ -436,7 +480,7 @@ try {
         }
 
         Set-ManagedJunction -LinkPath $currentDir -TargetPath $releaseDir -ManagedTargetPrefix $releasesDir
-        Set-ManagedJunction -LinkPath $visibleBinDir -TargetPath $releaseDir -ManagedTargetPrefix $standaloneRoot
+        Set-ManagedJunction -LinkPath $visibleBinDir -TargetPath $releaseDir -ManagedTargetPrefix $standaloneRoot -AllowLegacyHerdrBinMigration $allowLegacyVisibleBinMigration
 
         $herdrCommand = Join-Path $visibleBinDir "herdr.exe"
         & $herdrCommand --version *> $null

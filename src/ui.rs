@@ -63,7 +63,10 @@ pub(crate) use self::{
         open_existing_worktree_visible_start, remove_worktree_button_rects,
         remove_worktree_popup_rect, rename_button_rects,
     },
-    settings::{settings_button_rects, settings_show_primary_action},
+    settings::{
+        settings_button_rects, settings_popup_height, settings_show_primary_action,
+        SETTINGS_POPUP_WIDTH,
+    },
     sidebar::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_scroll_metrics,
         agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
@@ -80,7 +83,7 @@ pub(crate) use self::{
         mobile_switcher_areas, mobile_switcher_max_scroll, mobile_switcher_target_at,
         mobile_switcher_workspace_doc_range, MobileSwitcherTarget,
     },
-    panes::pane_is_scrolled_back,
+    panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
     tabs::compute_tab_bar_view,
     widgets::{centered_popup_rect, modal_stack_areas},
 };
@@ -307,7 +310,13 @@ fn compute_view_internal(
     let split_borders = app
         .active
         .and_then(|i| app.workspaces.get(i))
-        .map(|ws| ws.layout.splits(terminal_area))
+        .map(|ws| {
+            if ws.zoomed {
+                Vec::new()
+            } else {
+                ws.layout.splits(terminal_area)
+            }
+        })
         .unwrap_or_default();
 
     let pane_infos = compute_pane_infos(
@@ -382,7 +391,13 @@ fn compute_mobile_view(
     let split_borders = app
         .active
         .and_then(|i| app.workspaces.get(i))
-        .map(|ws| ws.layout.splits(terminal_area))
+        .map(|ws| {
+            if ws.zoomed {
+                Vec::new()
+            } else {
+                ws.layout.splits(terminal_area)
+            }
+        })
         .unwrap_or_default();
 
     let pane_infos = compute_pane_infos(
@@ -1072,7 +1087,6 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
 
         compute_view(&mut app, Rect::new(0, 0, 80, 30));
 
@@ -1276,6 +1290,7 @@ mod tests {
             rect: Rect::new(0, 0, 12, 8),
             inner_rect: Rect::new(1, 1, 9, 6),
             scrollbar_rect: Some(Rect::new(10, 1, 1, 6)),
+            borders: ratatui::widgets::Borders::ALL,
             is_focused: true,
         };
 
