@@ -95,17 +95,21 @@ use crate::terminal::TerminalRuntimeRegistry;
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
 /// A floating label rendered on top of the UI when the mouse hovers a sidebar
-/// entry whose name (or branch) was truncated to fit the column. Shows the full
-/// text — one line per row of the hovered entry (e.g. space name + branch).
+/// entry whose text was truncated to fit the column. Each tooltip is a single
+/// right-sized box wrapping just its own text (plus one column of padding on
+/// each side) — a hovered entry with multiple truncatable fields (e.g. a
+/// space's name and branch) gets one independently sized box per field instead
+/// of a single box stretched to fit the longest one.
 pub(crate) struct HoverTooltip {
-    /// Full, untruncated lines to display, each paired with the exact style it
-    /// is rendered with in the sidebar (so the box matches the truncated text's
-    /// color and weight).
-    pub lines: Vec<(String, Style)>,
+    /// Full, untruncated spans making up this box's one line of text, each
+    /// paired with the exact style it is rendered with in the sidebar (so the
+    /// box matches the truncated text's color and weight). Multiple spans let
+    /// a box mix styles on one line, e.g. branch text plus ahead/behind counts.
+    pub spans: Vec<(String, Style)>,
     /// Background of the hovered row, so the box preserves it (e.g. a selected
     /// space keeps its brighter background instead of resetting to default).
     pub bg: Color,
-    /// Screen row the first line should align to.
+    /// Screen row this box's line should align to.
     pub row: u16,
     /// Screen column where the truncated text begins.
     pub col: u16,
@@ -120,51 +124,58 @@ fn sidebar_hover_tooltip_allowed(mode: Mode) -> bool {
     )
 }
 
-/// Paint the hover tooltip as a floating bordered box over the rest of the UI.
+/// Paint one hover tooltip box as a floating single-line label over the rest
+/// of the UI. Call once per box in `HoverTooltip`s so each field gets its own
+/// right-sized box instead of a single box wide enough for all of them.
 fn render_hover_tooltip(_app: &AppState, frame: &mut Frame, tooltip: &HoverTooltip) {
     use ratatui::text::Line;
     use ratatui::widgets::{Block, Clear, Paragraph};
     use unicode_width::UnicodeWidthStr;
 
     let area = frame.area();
-    if tooltip.lines.is_empty() || area.width < 3 || area.height < 1 {
+    if tooltip.spans.is_empty() || area.width < 3 || area.height < 1 {
         return;
     }
 
-    // Box width = widest padded line (" text ", one space each side), clamped to
-    // the screen. The tooltip may overflow the sidebar into the panes — that is
-    // intentional, it paints over whatever sits beneath it.
-    let text_w = tooltip
-        .lines
+    // Box width = padded text (" text ", one space each side), sized to just
+    // this box's own spans and clamped to the screen. The tooltip may overflow
+    // the sidebar into the panes — that is intentional, it paints over
+    // whatever sits beneath it.
+    let text_w: u16 = tooltip
+        .spans
         .iter()
         .map(|(text, _)| UnicodeWidthStr::width(text.as_str()) as u16)
-        .max()
-        .unwrap_or(0);
+        .sum();
     let box_w = (text_w + 2).min(area.width);
-    let box_h = (tooltip.lines.len() as u16).min(area.height);
+    let box_h = 1u16.min(area.height);
 
-    // Align the first line directly with the hovered row, and the text (after
-    // its one-space pad) with the hovered column. Clamp so it stays on screen.
+    // Align the line directly with the hovered row, and the text (after its
+    // one-space pad) with the hovered column. Clamp so it stays on screen.
     let max_x = area.x + area.width - box_w;
     let x = tooltip.col.saturating_sub(1).clamp(area.x, max_x);
     let max_y = area.y + area.height - box_h;
     let y = tooltip.row.clamp(area.y, max_y);
     let rect = Rect::new(x, y, box_w, box_h);
 
-    // Each line keeps the exact style it has in the sidebar, so the expanded
+    // Each span keeps the exact style it has in the sidebar, so the expanded
     // text matches the truncated version's color and weight.
-    let lines: Vec<Line> = tooltip
-        .lines
-        .iter()
-        .map(|(text, style)| Line::from(Span::styled(format!(" {text} "), *style)))
-        .collect();
+    let mut line_spans: Vec<Span> = Vec::with_capacity(tooltip.spans.len() + 2);
+    line_spans.push(Span::raw(" "));
+    line_spans.extend(
+        tooltip
+            .spans
+            .iter()
+            .map(|(text, style)| Span::styled(text.clone(), *style)),
+    );
+    line_spans.push(Span::raw(" "));
 
     // Fill with the hovered row's own background so hovering never changes it:
     // an unselected space keeps the default background, a selected one keeps its
     // brighter background. Clear first to blank any underlying pane glyphs.
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().style(Style::default().bg(tooltip.bg))),
+        Paragraph::new(Line::from(line_spans))
+            .block(Block::default().style(Style::default().bg(tooltip.bg))),
         rect,
     );
 }
@@ -480,9 +491,10 @@ pub fn render_with_runtime_registry(
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
-    // Collected while rendering the sidebar: the full name of a truncated entry
-    // currently under the mouse, so we can paint an expanded tooltip on top.
-    let mut hover_tooltip: Option<HoverTooltip> = None;
+    // Collected while rendering the sidebar: one right-sized box per truncated
+    // field of the entry currently under the mouse, so we can paint expanded
+    // tooltips on top.
+    let mut hover_tooltips: Vec<HoverTooltip> = Vec::new();
 
     if app.view.layout == ViewLayout::Mobile {
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
@@ -495,7 +507,7 @@ pub fn render_with_runtime_registry(
                 terminal_runtimes,
                 frame,
                 sidebar_area,
-                &mut hover_tooltip,
+                &mut hover_tooltips,
             );
         }
     }
@@ -537,10 +549,11 @@ pub fn render_with_runtime_registry(
         Mode::Terminal => {}
     }
 
-    // Painted last so the expanded name sits on top of every other element.
-    if let Some(tooltip) = hover_tooltip {
-        if sidebar_hover_tooltip_allowed(app.mode) {
-            render_hover_tooltip(app, frame, &tooltip);
+    // Painted last so the expanded name/branch boxes sit on top of every
+    // other element.
+    if sidebar_hover_tooltip_allowed(app.mode) {
+        for tooltip in &hover_tooltips {
+            render_hover_tooltip(app, frame, tooltip);
         }
     }
 }
@@ -1213,6 +1226,79 @@ mod tests {
     }
 
     #[test]
+    fn render_hover_tooltip_boxes_are_sized_to_their_own_text() {
+        let app = crate::app::state::AppState::test_new();
+        let bg = Color::Rgb(10, 20, 30);
+        let short = HoverTooltip {
+            spans: vec![("short".to_string(), Style::default())],
+            bg,
+            row: 2,
+            col: 5,
+        };
+        let long = HoverTooltip {
+            spans: vec![("a much longer piece of text".to_string(), Style::default())],
+            bg,
+            row: 5,
+            col: 5,
+        };
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_hover_tooltip(&app, frame, &short);
+                render_hover_tooltip(&app, frame, &long);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let box_width_at = |row: u16| (0..80).filter(|&x| buffer[(x, row)].bg == bg).count();
+
+        let short_w = box_width_at(2);
+        let long_w = box_width_at(5);
+
+        assert_eq!(short_w, "short".len() + 2);
+        assert_eq!(long_w, "a much longer piece of text".len() + 2);
+        assert_ne!(
+            short_w, long_w,
+            "each box should be sized to its own text, not a shared width"
+        );
+    }
+
+    #[test]
+    fn hovering_branch_tooltip_includes_ahead_behind() {
+        let long_branch = "feature/a-really-long-branch-name-that-will-not-fit";
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("ws");
+        ws.set_custom_name("ws".to_string());
+        ws.cached_git_branch = Some(long_branch.to_string());
+        ws.cached_git_ahead_behind = Some((3, 2));
+        app.workspaces = vec![ws];
+        app.selected = 0;
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let card = app.view.workspace_card_areas[0].rect;
+        app.last_mouse_pos = Some((card.x + 1, card.y));
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..20)
+            .map(|row| (0..80).map(|x| buffer[(x, row)].symbol()).collect())
+            .collect();
+
+        assert!(
+            rows.iter().any(|line| line.contains(long_branch)
+                && line.contains("↑3")
+                && line.contains("↓2")),
+            "branch tooltip should include ahead/behind counts, rows: {rows:?}"
+        );
+    }
+
+    #[test]
     fn hovering_truncated_agent_name_paints_full_name_tooltip() {
         let long_name = "long agent name that will not be shown completely";
         let mut app = crate::app::state::AppState::test_new();
@@ -1268,6 +1354,53 @@ mod tests {
         assert!(
             rows.iter().any(|line| line.contains(long_name)),
             "full agent name should be painted on hover, rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn hovering_agent_status_row_also_paints_full_name_tooltip() {
+        let long_name = "long agent name that will not be shown completely";
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("ws");
+        ws.set_custom_name(long_name.to_string());
+        let root_pane = ws.tabs[0].root_pane;
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        let root_terminal_id = app.workspaces[0].tabs[0].panes[&root_pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&root_terminal_id)
+            .unwrap()
+            .detected_agent = Some(crate::detect::Agent::Claude);
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 30));
+
+        let (_, detail_area) =
+            expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+        let metrics = agent_panel_scroll_metrics(&app, detail_area);
+        let body = agent_panel_body_rect(detail_area, should_show_scrollbar(metrics));
+        assert!(body != Rect::default(), "agent panel body should render");
+
+        // Hovering the status row (one row below the name) should reveal the
+        // full name too, matching the spaces section where a hover anywhere
+        // on the card — not just its name — expands the truncated field.
+        app.last_mouse_pos = Some((body.x + 3, body.y + 1));
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..30)
+            .map(|row| (0..80).map(|x| buffer[(x, row)].symbol()).collect())
+            .collect();
+
+        assert!(
+            rows.iter().any(|line| line.contains(long_name)),
+            "full agent name should be painted when hovering the status row, rows: {rows:?}"
         );
     }
 

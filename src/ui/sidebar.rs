@@ -814,7 +814,7 @@ pub(super) fn render_sidebar(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
     area: Rect,
-    hover_tooltip: &mut Option<HoverTooltip>,
+    hover_tooltips: &mut Vec<HoverTooltip>,
 ) {
     let p = &app.palette;
     let is_navigating = matches!(app.mode, Mode::Navigate);
@@ -839,9 +839,9 @@ pub(super) fn render_sidebar(
         frame,
         ws_area,
         is_navigating,
-        hover_tooltip,
+        hover_tooltips,
     );
-    render_agent_detail(app, terminal_runtimes, frame, detail_area, hover_tooltip);
+    render_agent_detail(app, terminal_runtimes, frame, detail_area, hover_tooltips);
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
@@ -851,7 +851,7 @@ fn render_workspace_list(
     frame: &mut Frame,
     area: Rect,
     is_navigating: bool,
-    hover_tooltip: &mut Option<HoverTooltip>,
+    hover_tooltips: &mut Vec<HoverTooltip>,
 ) {
     let p = &app.palette;
     let dragged_ws_idx = match app.drag.as_ref().map(|drag| &drag.target) {
@@ -964,37 +964,29 @@ fn render_workspace_list(
             line1.push(Span::styled(label, name_style));
         }
 
-        // If the mouse hovers anywhere on this card, capture the full name and
-        // whether it was truncated. A name-only tooltip is emitted now; the
-        // branch block below upgrades it to a combined name + branch tooltip so
-        // a single hover expands the whole card.
-        let mut hovered_name: Option<(String, Style, bool, u16)> = None;
-        if let Some((mx, my)) = app.last_mouse_pos {
-            let over_card = mx >= card.rect.x
+        // If the mouse hovers anywhere on this card (name row or branch row),
+        // capture the full name and whether it was truncated. The branch
+        // block below decides, once the branch's own truncation is known,
+        // whether to push one right-sized tooltip box per field.
+        let over_card = app.last_mouse_pos.is_some_and(|(mx, my)| {
+            mx >= card.rect.x
                 && mx < card.rect.x + card.rect.width
                 && my >= row_y
-                && my < row_y + row_height;
-            if over_card {
-                if let Some((name, prefix_width)) = line1.split_last().map(|(name, prefix)| {
-                    let prefix_width: usize = prefix
-                        .iter()
-                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                        .sum();
-                    (name.content.as_ref(), prefix_width)
-                }) {
-                    let available = (card.rect.width as usize).saturating_sub(prefix_width);
-                    let truncated = UnicodeWidthStr::width(name) > available;
-                    let name_col = card.rect.x + prefix_width as u16;
-                    if truncated {
-                        *hover_tooltip = Some(HoverTooltip {
-                            lines: vec![(name.to_string(), name_style)],
-                            bg: card_bg,
-                            row: row_y,
-                            col: name_col,
-                        });
-                    }
-                    hovered_name = Some((name.to_string(), name_style, truncated, name_col));
-                }
+                && my < row_y + row_height
+        });
+        let mut hovered_name: Option<(String, Style, bool, u16)> = None;
+        if over_card {
+            if let Some((name, prefix_width)) = line1.split_last().map(|(name, prefix)| {
+                let prefix_width: usize = prefix
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum();
+                (name.content.as_ref(), prefix_width)
+            }) {
+                let available = (card.rect.width as usize).saturating_sub(prefix_width);
+                let truncated = UnicodeWidthStr::width(name) > available;
+                let name_col = card.rect.x + prefix_width as u16;
+                hovered_name = Some((name.to_string(), name_style, truncated, name_col));
             }
         }
 
@@ -1032,20 +1024,33 @@ fn render_workspace_list(
                 };
                 let branch_style = Style::default().fg(branch_color);
                 let branch_indent = if card.indented { "     " } else { "   " };
+                let branch_col = card.rect.x + branch_indent.len() as u16;
 
-                // When the card is hovered, expand the whole card into one
-                // tooltip: full name plus full branch. Each line keeps its own
-                // sidebar style. Shown whenever the name or the branch was cut.
+                // When the card is hovered, expand the whole card: full name
+                // and full branch (plus ahead/behind), each in its own
+                // right-sized box positioned over its own text. Shown
+                // whenever the name or the branch was cut, so hovering either
+                // row reveals both.
                 if let Some((full_name, name_style, name_truncated, name_col)) = &hovered_name {
                     if *name_truncated || branch_truncated {
-                        *hover_tooltip = Some(HoverTooltip {
-                            lines: vec![
-                                (full_name.clone(), *name_style),
-                                (full_branch, branch_style),
-                            ],
+                        hover_tooltips.push(HoverTooltip {
+                            spans: vec![(full_name.clone(), *name_style)],
                             bg: card_bg,
                             row: row_y,
                             col: *name_col,
+                        });
+                        let mut branch_spans = vec![(full_branch.clone(), branch_style)];
+                        if let Some(parts) = &upstream_label {
+                            for (label, color) in parts {
+                                branch_spans.push((" ".to_string(), Style::default()));
+                                branch_spans.push((label.clone(), Style::default().fg(*color)));
+                            }
+                        }
+                        hover_tooltips.push(HoverTooltip {
+                            spans: branch_spans,
+                            bg: card_bg,
+                            row: row_y + 1,
+                            col: branch_col,
                         });
                     }
                 }
@@ -1067,6 +1072,13 @@ fn render_workspace_list(
                     Rect::new(card.rect.x, row_y + 1, card.rect.width, 1),
                 );
             }
+        } else if let Some((full_name, name_style, true, name_col)) = &hovered_name {
+            hover_tooltips.push(HoverTooltip {
+                spans: vec![(full_name.clone(), *name_style)],
+                bg: card_bg,
+                row: row_y,
+                col: *name_col,
+            });
         }
     }
 
@@ -1116,7 +1128,7 @@ fn render_agent_detail(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
     area: Rect,
-    hover_tooltip: &mut Option<HoverTooltip>,
+    hover_tooltips: &mut Vec<HoverTooltip>,
 ) {
     let p = &app.palette;
 
@@ -1199,6 +1211,7 @@ fn render_agent_detail(
         let primary_truncated = primary_full != primary_label;
         // " " + icon + " " precede the name (icon is single-width).
         let name_col = body.x.saturating_add(3);
+        let entry_top = row_y;
         let name_line = Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled(icon, icon_style),
@@ -1209,24 +1222,6 @@ fn render_agent_detail(
             Paragraph::new(name_line).style(row_style),
             Rect::new(body.x, row_y, body.width, 1),
         );
-
-        // Hovering the entry's name row reveals the full name when truncated.
-        if primary_truncated {
-            if let Some((mx, my)) = app.last_mouse_pos {
-                if my == row_y && mx >= body.x && mx < body.x + body.width {
-                    *hover_tooltip = Some(HoverTooltip {
-                        lines: vec![(primary_full, name_style)],
-                        bg: if is_active {
-                            p.surface_dim
-                        } else {
-                            Color::Reset
-                        },
-                        row: row_y,
-                        col: name_col,
-                    });
-                }
-            }
-        }
 
         row_y += 1;
 
@@ -1246,6 +1241,27 @@ fn render_agent_detail(
             Paragraph::new(Line::from(status_spans)).style(row_style),
             Rect::new(body.x, row_y, body.width, 1),
         );
+
+        // Hovering the entry's name row or status row reveals the full name
+        // when truncated — matching the spaces section, where hovering
+        // anywhere on the card (not just the name itself) expands it.
+        if primary_truncated {
+            if let Some((mx, my)) = app.last_mouse_pos {
+                if (my == entry_top || my == row_y) && mx >= body.x && mx < body.x + body.width {
+                    hover_tooltips.push(HoverTooltip {
+                        spans: vec![(primary_full, name_style)],
+                        bg: if is_active {
+                            p.surface_dim
+                        } else {
+                            Color::Reset
+                        },
+                        row: entry_top,
+                        col: name_col,
+                    });
+                }
+            }
+        }
+
         row_y += 1;
 
         if row_y < body_bottom {
@@ -1590,7 +1606,7 @@ mod tests {
                     frame,
                     Rect::new(0, 0, 15, 6),
                     false,
-                    &mut None,
+                    &mut Vec::new(),
                 )
             })
             .expect("workspace list should render");
