@@ -4,7 +4,7 @@ use ratatui::layout::Direction;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
-    LayoutNode, LayoutPane, ResponseResult, SplitDirection,
+    LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
 };
 use crate::app::{App, Mode};
 use crate::layout::{Node, PaneId};
@@ -214,6 +214,38 @@ impl App {
         encode_success(id, ResponseResult::LayoutApply { layout })
     }
 
+    pub(super) fn handle_layout_set_split_ratio(
+        &mut self,
+        id: String,
+        params: LayoutSetSplitRatioParams,
+    ) -> String {
+        if !params.ratio.is_finite() {
+            return encode_error(id, "invalid_ratio", "ratio must be finite");
+        }
+        let Some((ws_idx, tab_idx)) = self.resolve_layout_export_target(&LayoutExportParams {
+            tab_id: params.tab_id,
+            pane_id: params.pane_id,
+        }) else {
+            return encode_error(id, "layout_not_found", "layout target not found");
+        };
+
+        let changed = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|ws| ws.tabs.get_mut(tab_idx))
+            .is_some_and(|tab| tab.layout.set_ratio_at(&params.path, params.ratio));
+        if !changed {
+            return encode_error(id, "split_not_found", "split path not found");
+        }
+
+        self.schedule_session_save();
+        let Some(layout) = self.layout_description(ws_idx, tab_idx) else {
+            return encode_error(id, "layout_not_found", "layout unavailable");
+        };
+        encode_success(id, ResponseResult::LayoutSplitRatioSet { layout })
+    }
+
     fn resolve_layout_export_target(&self, params: &LayoutExportParams) -> Option<(usize, usize)> {
         match (params.tab_id.as_deref(), params.pane_id.as_deref()) {
             (Some(_), Some(_)) => None,
@@ -313,11 +345,9 @@ impl App {
                 &self.terminal_runtimes,
             )
         });
-        self.resolve_new_terminal_cwd(follow_cwd.or_else(|| {
-            self.state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-                .and_then(|runtime| runtime.cwd())
-        }))
+        self.resolve_new_terminal_cwd(
+            follow_cwd.or_else(|| self.focused_pane_cwd_in_workspace(ws_idx)),
+        )
     }
 
     fn apply_layout_node_to_pane(
@@ -363,16 +393,11 @@ impl App {
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
-        let cwd = pane.cwd.as_ref().map(PathBuf::from).or_else(|| {
-            self.state.workspaces.get(ws_idx).and_then(|ws| {
-                let tab_idx = ws.find_tab_index_for_pane(target_pane_id)?;
-                ws.tabs.get(tab_idx)?.cwd_for_pane(
-                    target_pane_id,
-                    &self.state.terminals,
-                    &self.terminal_runtimes,
-                )
-            })
-        });
+        let cwd = pane
+            .cwd
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| self.cwd_for_pane_in_workspace(ws_idx, target_pane_id));
         let extra_env = super::env::normalize_launch_env(pane.env.clone())
             .map_err(|(_, message)| message.to_string())?;
         let direction = match direction {
@@ -564,9 +589,19 @@ mod tests {
     use super::*;
     use crate::{
         api::schema::{ErrorResponse, ResponseResult, SuccessResponse},
-        config::Config,
+        config::{Config, ShellModeConfig},
         workspace::Workspace,
     };
+
+    #[cfg(windows)]
+    fn exiting_test_command() -> &'static str {
+        "C:\\Windows\\System32\\whoami.exe"
+    }
+
+    #[cfg(not(windows))]
+    fn exiting_test_command() -> &'static str {
+        "/usr/bin/true"
+    }
 
     fn app_with_workspace() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -577,11 +612,20 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
+        app.state.default_shell = exiting_test_command().into();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
         app.state.workspaces = vec![Workspace::test_new("layout")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.ensure_test_terminals();
         app
+    }
+
+    fn shutdown_test_runtimes(app: &mut App) {
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
     }
 
     #[test]
@@ -634,6 +678,49 @@ mod tests {
         };
         assert_eq!(pane.label.as_deref(), Some("tests"));
         assert_eq!(pane.pane_id, Some(app.public_pane_id(0, right).unwrap()));
+    }
+
+    #[test]
+    fn layout_set_split_ratio_updates_existing_split() {
+        let mut app = app_with_workspace();
+        app.state.workspaces[0].test_split(Direction::Horizontal);
+
+        let response = app.handle_layout_set_split_ratio(
+            "req".into(),
+            LayoutSetSplitRatioParams {
+                tab_id: None,
+                pane_id: None,
+                path: vec![],
+                ratio: 0.72,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::LayoutSplitRatioSet { layout } = success.result else {
+            panic!("expected layout split ratio set response");
+        };
+        let LayoutNode::Split { ratio, .. } = layout.root else {
+            panic!("expected split layout root");
+        };
+        assert!((ratio - 0.72).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn layout_set_split_ratio_rejects_missing_split() {
+        let mut app = app_with_workspace();
+
+        let response = app.handle_layout_set_split_ratio(
+            "req".into(),
+            LayoutSetSplitRatioParams {
+                tab_id: None,
+                pane_id: None,
+                path: vec![],
+                ratio: 0.72,
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "split_not_found");
     }
 
     #[tokio::test]
@@ -704,6 +791,43 @@ mod tests {
             second_pane.command,
             Some(vec!["sh".into(), "-c".into(), "true".into()])
         );
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn layout_apply_new_tab_follows_cached_focused_pane_cwd_without_runtime() {
+        let mut app = app_with_workspace();
+        let focused_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let cached_cwd = std::env::temp_dir();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(focused_pane)
+            .cloned()
+            .unwrap();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = cached_cwd.clone();
+
+        let response = app.handle_layout_apply(
+            "req".into(),
+            LayoutApplyParams {
+                workspace_id: None,
+                tab_id: None,
+                tab_label: Some("cached".into()),
+                focus: false,
+                root: LayoutNode::Pane {
+                    pane: LayoutPane::default(),
+                },
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::LayoutApply { .. }));
+        let created = &app.state.workspaces[0].tabs[1];
+        let created_terminal_id = created.terminal_id(created.root_pane).unwrap();
+        let created_cwd = &app.state.terminals.get(created_terminal_id).unwrap().cwd;
+        assert_eq!(
+            crate::worktree::canonical_or_original(created_cwd),
+            crate::worktree::canonical_or_original(&cached_cwd)
+        );
+        shutdown_test_runtimes(&mut app);
     }
 
     #[tokio::test]

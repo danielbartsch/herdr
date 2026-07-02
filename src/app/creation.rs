@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
+#[cfg(test)]
 use tracing::error;
 
 use super::{
@@ -37,6 +38,23 @@ impl App {
             .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
     }
 
+    pub(super) fn cwd_for_pane_in_workspace(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<PathBuf> {
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
+        ws.tabs
+            .get(tab_idx)?
+            .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
+    }
+
+    pub(super) fn focused_pane_cwd_in_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
+        let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
+        self.cwd_for_pane_in_workspace(ws_idx, pane_id)
+    }
+
     pub(super) fn resolve_new_terminal_cwd(&self, follow_cwd: Option<PathBuf>) -> PathBuf {
         resolve_new_terminal_cwd(&self.state.new_terminal_cwd, follow_cwd)
     }
@@ -57,6 +75,7 @@ impl App {
     }
 
     /// Create a workspace with a real PTY (needs event_tx).
+    #[cfg(test)]
     pub(crate) fn create_workspace(&mut self) {
         let follow_cwd = self
             .workspace_creation_source()
@@ -68,6 +87,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn create_tab(&mut self) {
         let custom_name = self.state.requested_new_tab_name.take();
         let active_before = self.state.active;
@@ -109,6 +129,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn create_tab_with_options(
         &mut self,
         initial_cwd: PathBuf,
@@ -154,6 +175,7 @@ impl App {
         self.create_workspace_with_launch_env(initial_cwd, focus, Vec::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn create_workspace_with_events(
         &mut self,
         initial_cwd: PathBuf,
