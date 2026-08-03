@@ -69,6 +69,7 @@ impl App {
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let extra_env = match super::env::normalize_launch_env(env) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
@@ -85,6 +86,7 @@ impl App {
                     cwd,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                     crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
                     extra_env,
                 )
@@ -155,6 +157,13 @@ impl App {
         };
         tab.set_custom_name(params.label.clone());
         crate::logging::tab_renamed(&workspace_id, &tab_id);
+        if self.state.active == Some(ws_idx) {
+            // Reflow the tab bar so the new label width takes effect immediately.
+            // The tab bar renders into cached hit areas; without this refresh the
+            // old geometry lingers until the next refresh (e.g. a tab switch),
+            // leaving the visible label stale. Mirrors handle_tab_move.
+            self.state.refresh_tab_bar_view();
+        }
         self.schedule_session_save();
         self.emit_event(EventEnvelope {
             event: EventKind::TabRenamed,
@@ -223,24 +232,50 @@ impl App {
             return tab_not_found(id, &target.tab_id);
         };
         let workspace_id = self.public_workspace_id(ws_idx);
+        let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            return tab_not_found(id, &target.tab_id);
+        };
+        let closes_workspace = ws.tabs.len() <= 1;
         let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
-        let pane_ids = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.tabs.get(tab_idx))
+        let pane_ids = ws
+            .tabs
+            .get(tab_idx)
             .map(|tab| tab.layout.pane_ids())
             .unwrap_or_default();
+
+        if closes_workspace {
+            if self.state.confirm_implicit_worktree_group_close(ws_idx) {
+                return encode_error(
+                    id,
+                    "confirmation_required",
+                    "closing this tab would close a worktree group",
+                );
+            }
+            let workspace = self.workspace_info(ws_idx);
+            self.state.selected = ws_idx;
+            self.state.close_selected_workspace();
+            self.state.remove_plugin_pane_records(pane_ids);
+            self.shutdown_detached_terminal_runtimes();
+            self.emit_event(EventEnvelope {
+                event: EventKind::TabClosed,
+                data: EventData::TabClosed {
+                    tab_id,
+                    workspace_id: workspace_id.clone(),
+                },
+            });
+            self.emit_event(EventEnvelope {
+                event: EventKind::WorkspaceClosed,
+                data: EventData::WorkspaceClosed {
+                    workspace_id,
+                    workspace: Some(workspace),
+                },
+            });
+            return encode_success(id, ResponseResult::Ok {});
+        }
+
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return tab_not_found(id, &target.tab_id);
         };
-        if ws.tabs.len() <= 1 {
-            return encode_error(
-                id,
-                "tab_close_failed",
-                "cannot close the last tab in a workspace",
-            );
-        }
         if !ws.close_tab(tab_idx) {
             return encode_error(
                 id,
@@ -248,9 +283,7 @@ impl App {
                 format!("tab {} could not be closed", target.tab_id),
             );
         }
-        for pane_id in pane_ids {
-            self.state.plugin_panes.remove(&pane_id);
-        }
+        self.state.remove_plugin_pane_records(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
         self.shutdown_detached_terminal_runtimes();
         self.schedule_session_save();
@@ -301,6 +334,53 @@ mod tests {
     };
 
     #[test]
+    fn api_tab_close_last_tab_closes_workspace_and_emits_both_events() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        app.state.workspaces = vec![Workspace::test_new("tabs")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+        let workspace_id = app.public_workspace_id(0);
+
+        let response = app.handle_tab_close(
+            "req".into(),
+            TabTarget {
+                tab_id: tab_id.clone(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert!(app.state.workspaces.is_empty());
+        assert!(app.state.active.is_none());
+        let events = event_hub.events_after(0);
+        assert_eq!(
+            events
+                .iter()
+                .map(|(_, event)| event.event)
+                .collect::<Vec<_>>(),
+            [EventKind::TabClosed, EventKind::WorkspaceClosed]
+        );
+        assert!(matches!(
+            &events[0].1.data,
+            EventData::TabClosed {
+                tab_id: closed_tab_id,
+                workspace_id: closed_workspace_id,
+            } if closed_tab_id == &tab_id && closed_workspace_id == &workspace_id
+        ));
+        assert!(matches!(
+            &events[1].1.data,
+            EventData::WorkspaceClosed {
+                workspace_id: closed_workspace_id,
+                workspace: Some(workspace),
+            } if closed_workspace_id == &workspace_id
+                && workspace.workspace_id == workspace_id
+        ));
+    }
+
+    #[test]
     fn api_tab_move_reorders_tabs_in_target_workspace() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -342,6 +422,37 @@ mod tests {
                     && tabs[2].tab_id == moved_id
             )
         }));
+    }
+
+    #[test]
+    fn api_tab_rename_reflows_active_tab_bar() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub);
+        let workspace = Workspace::test_new("tabs");
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.view.tab_bar_rect = ratatui::layout::Rect::new(0, 0, 60, 1);
+        app.state.refresh_tab_bar_view();
+
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+        let width_before = app.state.view.tab_hit_areas[0].width;
+
+        app.handle_tab_rename(
+            "req".into(),
+            TabRenameParams {
+                tab_id,
+                label: "a much longer custom tab label".into(),
+            },
+        );
+
+        let width_after = app.state.view.tab_hit_areas[0].width;
+        assert!(
+            width_after > width_before,
+            "tab bar should reflow to the new label width immediately: \
+             before={width_before}, after={width_after}"
+        );
     }
 
     #[tokio::test]

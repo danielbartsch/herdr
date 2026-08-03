@@ -6,35 +6,37 @@
 
 pub(crate) mod actions;
 mod agent_resume;
+pub(crate) mod agent_view;
 mod agents;
 mod api;
 mod api_helpers;
+pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
 mod creation;
+mod git_refresh;
 mod ids;
 mod input;
+mod popup;
 mod runtime;
 mod runtime_mutations;
 mod session;
 pub mod state;
 mod terminal_targets;
+mod terminal_titles;
 mod theme_sync;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
-pub(crate) const ANIMATION_INTERVAL: Duration = Duration::from_millis(16);
-pub(crate) const HEADLESS_ANIMATION_INTERVAL: Duration = Duration::from_millis(128);
-pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = 8;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -107,8 +109,10 @@ pub struct App {
     pub(crate) copy_feedback_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
+    pub(crate) last_git_repo_discovery_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
+    pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
@@ -116,26 +120,32 @@ pub struct App {
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
+    pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
-    pub(crate) next_animation_tick: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
     pub(crate) update_manifest_check_enabled: bool,
+    pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
+    pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) detached_custom_command_children: Vec<std::process::Child>,
     pub(crate) persist_pane_history: bool,
     pub(crate) last_render_at: Option<Instant>,
-    pub(crate) suppressed_repeat_keys:
-        HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    pub(crate) input_leases: input::InputLeaseTable,
     pub render_notify: Arc<Notify>,
-    pub render_dirty: Arc<AtomicBool>,
+    pub(crate) render_dirty: Arc<crate::render_signal::RenderSignal>,
     pub(crate) full_redraw_pending: bool,
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
+    /// Whether this process applies `AppEvent::PrefixInputSource` to the host input source.
+    /// The headless server sets this to false: the switch belongs to the foreground client,
+    /// even when an App-internal drain consumes the event before the forwarding drain.
+    pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
@@ -187,11 +197,19 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
     }
 }
 
-fn repeat_key_identity(
-    key: &crate::input::TerminalKey,
-) -> (crossterm::event::KeyCode, crossterm::event::KeyModifiers) {
-    (key.code, key.modifiers)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalInputTarget {
+    terminal_id: crate::terminal::TerminalId,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalInputContext {
+    Pane,
+    Popup(crate::terminal::TerminalId),
+}
+
+pub(crate) type InputSourceId = u64;
+const LOCAL_INPUT_SOURCE: InputSourceId = 0;
 
 fn auto_updates_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(debug_assertions)
@@ -354,7 +372,7 @@ impl App {
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
-        let render_dirty = Arc::new(AtomicBool::new(false));
+        let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
@@ -489,7 +507,12 @@ impl App {
             state::Mode::Navigate
         };
 
+        #[cfg(not(test))]
         let agent_manifest_summaries = crate::detect::manifest::reload_manifests();
+        // Nextest runs each unit test in a fresh process. Manifest-sensitive tests reload
+        // explicitly; unrelated App tests should not recompile every bundled regex.
+        #[cfg(test)]
+        let agent_manifest_summaries = Vec::new();
         let theme_runtime = theme_runtime_config(config, true);
         let (theme_palette, theme_name) = resolve_effective_theme(&theme_runtime, None);
 
@@ -520,6 +543,7 @@ impl App {
             request_clipboard_write: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
+            pending_workspace_create_cwd: None,
             rename_pane_target: None,
             worktree_create: None,
             worktree_open: None,
@@ -540,7 +564,7 @@ impl App {
                     preview: announcement.preview,
                 }
             }),
-            keybind_help: state::KeybindHelpState { scroll: 0 },
+            keybind_help: state::KeybindHelpState::default(),
             navigator: state::NavigatorState::default(),
             copy_mode: None,
             workspace_scroll: 0,
@@ -589,22 +613,29 @@ impl App {
             mobile_width_threshold: config.ui.mobile_width_threshold,
             sidebar_width_source,
             sidebar_width_auto: false,
-            sidebar_collapsed: false,
+            sidebar_collapsed: config.ui.sidebar_start_collapsed,
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
             agent_panel_sort,
+            agent_view_override: None,
+            sidebar_agents: config.ui.sidebar.agents.clone(),
+            sidebar_spaces: config.ui.sidebar.spaces.clone(),
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
+            copy_on_select: config.ui.copy_on_select,
             right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
             right_click_passthrough: None,
             redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
+            prompt_new_workspace_name: config.ui.prompt_new_workspace_name,
             pane_borders: config.ui.pane_borders,
+            pane_scrollbars: config.ui.pane_scrollbars,
             pane_gaps: config.ui.pane_gaps,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
+            tab_bar_position: config.ui.tab_bar_position,
             pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -623,7 +654,6 @@ impl App {
             local_sound_playback: true,
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
-            spinner_tick: 0,
             palette: theme_palette,
             theme_name,
             theme_runtime,
@@ -641,11 +671,16 @@ impl App {
             integration_install_messages: Vec::new(),
             installed_plugins: load_plugin_registry(no_session),
             plugin_panes: std::collections::HashMap::new(),
+            pane_graphics_layers: std::collections::HashMap::new(),
+            pane_graphics_streams: std::collections::HashMap::new(),
+            pane_graphics_revision: 0,
+            popup_pane: None,
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
+            host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         };
@@ -694,8 +729,10 @@ impl App {
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+            last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
+            git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
@@ -703,22 +740,25 @@ impl App {
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
             last_pane_click: None,
+            pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
-            next_animation_tick: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             update_version_check_enabled: config.update.version_check,
             update_manifest_check_enabled: config.update.manifest_check,
+            loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
+            session_save_thread: None,
+            detached_custom_command_children: Vec::new(),
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
             last_render_at: None,
-            suppressed_repeat_keys: HashSet::new(),
+            input_leases: input::InputLeaseTable::default(),
             api_rx,
             event_hub,
             last_focus,
@@ -730,6 +770,7 @@ impl App {
             full_redraw_pending: false,
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
+            local_input_source_switch: true,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
@@ -761,6 +802,7 @@ impl App {
         let pane_id_aliases = crate::persist::handoff_pane_aliases(snapshot, &workspaces);
 
         app.no_session = false;
+        app.state.installed_plugins = load_plugin_registry(app.no_session);
         let now = Instant::now();
         if background_update_check_enabled(app.no_session, app.update_version_check_enabled) {
             app.next_auto_update_check = app
@@ -815,30 +857,39 @@ impl App {
         self.terminal_runtimes.assume_handoff_ownership();
     }
 
-    fn request_full_redraw(&mut self) {
+    fn request_repaint(&mut self) {
         self.full_redraw_pending = true;
     }
 
     pub(crate) fn sync_prefix_input_source(&mut self, previous_mode: Mode) {
-        match (
-            previous_mode == Mode::Prefix,
-            self.state.mode == Mode::Prefix,
+        // Emit the input-source intent on entering/leaving the ASCII realm, like `ClipboardWrite`;
+        // the foreground (client, or this app in monolithic mode) applies the switch. Keyed on the
+        // realm so multi-level prefix commands stay ASCII. The switch is flag-gated but the restore
+        // always fires on exit, so a mid-interaction flag toggle can't strand the host on ASCII.
+        let active = match (
+            previous_mode.wants_ascii_input(),
+            self.state.mode.wants_ascii_input(),
         ) {
-            (false, true) if self.state.switch_ascii_input_source_in_prefix => {
-                self.prefix_input_source.switch_to_ascii();
-            }
-            (true, false) => self.prefix_input_source.restore(),
-            _ => {}
+            (false, true) if self.state.switch_ascii_input_source_in_prefix => true,
+            (true, false) => false,
+            _ => return,
+        };
+        if let Err(err) = self
+            .event_tx
+            .try_send(crate::events::AppEvent::PrefixInputSource { active })
+        {
+            tracing::warn!(active, %err, "failed to queue prefix input-source change");
         }
     }
 
     pub(crate) fn handle_internal_event_with_prefix_sync(
         &mut self,
         event: crate::events::AppEvent,
-    ) {
+    ) -> bool {
         let previous_mode = self.state.mode;
-        self.handle_internal_event(event);
+        let changed = self.handle_internal_event_with_render_impact(event);
         self.sync_prefix_input_source(previous_mode);
+        changed
     }
 
     #[cfg(test)]
@@ -857,15 +908,24 @@ impl App {
 
         let mut needs_render = true;
         let mut host_mouse_capture_active = self.state.mouse_capture;
+        let mut host_keyboard_report_all_active = false;
 
         while !self.state.should_quit {
-            if self.render_dirty.load(Ordering::Acquire) {
+            self.reap_finished_custom_commands();
+            if self.render_dirty.is_pending() {
+                needs_render = true;
+            }
+            let terminal_title_changed = self.sync_terminal_titles();
+            if terminal_title_changed && self.terminal_title_sidebar_configured() {
                 needs_render = true;
             }
 
             // Drain a bounded internal-event batch for responsiveness. API handlers
             // perform an exhaustive drain before reading pane/runtime state.
             if self.drain_internal_events() {
+                needs_render = true;
+            }
+            if self.expire_due_metadata(Instant::now()) {
                 needs_render = true;
             }
             if self.drain_api_requests() {
@@ -888,16 +948,14 @@ impl App {
 
             if self.state.request_new_workspace {
                 self.state.request_new_workspace = false;
-                self.dispatch_runtime_mutation(
+                self.runtime_workspace_create(
                     "tui.workspace.create",
-                    crate::api::schema::Method::WorkspaceCreate(
-                        crate::api::schema::WorkspaceCreateParams {
-                            cwd: None,
-                            focus: true,
-                            label: None,
-                            env: Default::default(),
-                        },
-                    ),
+                    crate::api::schema::WorkspaceCreateParams {
+                        cwd: None,
+                        focus: true,
+                        label: None,
+                        env: Default::default(),
+                    },
                 );
                 needs_render = true;
             }
@@ -905,15 +963,15 @@ impl App {
             if self.state.request_new_tab {
                 self.state.request_new_tab = false;
                 let label = self.state.requested_new_tab_name.take();
-                self.dispatch_runtime_mutation(
+                self.runtime_tab_create(
                     "tui.tab.create",
-                    crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
+                    crate::api::schema::TabCreateParams {
                         workspace_id: None,
                         cwd: None,
                         focus: true,
                         label,
                         env: Default::default(),
-                    }),
+                    },
                 );
                 needs_render = true;
             }
@@ -929,16 +987,14 @@ impl App {
             }
 
             if let Some(cwd) = self.state.request_new_workspace_cwd.take() {
-                self.dispatch_runtime_mutation(
+                self.runtime_workspace_create(
                     "tui.workspace.create_cwd",
-                    crate::api::schema::Method::WorkspaceCreate(
-                        crate::api::schema::WorkspaceCreateParams {
-                            cwd: Some(cwd.display().to_string()),
-                            focus: true,
-                            label: None,
-                            env: Default::default(),
-                        },
-                    ),
+                    crate::api::schema::WorkspaceCreateParams {
+                        cwd: Some(cwd.display().to_string()),
+                        focus: true,
+                        label: None,
+                        env: Default::default(),
+                    },
                 );
                 needs_render = true;
             }
@@ -977,25 +1033,32 @@ impl App {
             }
 
             let now = Instant::now();
-            self.sync_animation_timer(now);
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
+            self.sync_host_keyboard_report_all(&mut host_keyboard_report_all_active)?;
 
             if needs_render && self.can_render_now(now) {
-                self.render_dirty.swap(false, Ordering::AcqRel);
+                let _ = self.render_dirty.take();
                 let _sync_output = SyncOutputGuard::begin()?;
                 let kitty_graphics_enabled = self.state.kitty_graphics_enabled;
                 if self.full_redraw_pending {
-                    if kitty_graphics_enabled {
-                        crate::kitty_graphics::clear_all_host_graphics()?;
+                    for cell in &mut terminal.current_buffer_mut().content {
+                        cell.set_skip(true);
                     }
-                    terminal.clear()?;
+                    terminal.swap_buffers();
                     self.full_redraw_pending = false;
                 }
                 let mut cell_size = crate::kitty_graphics::HostCellSize::default();
                 terminal.draw(|frame| {
                     let area = frame.area();
                     if kitty_graphics_enabled {
-                        cell_size = crate::kitty_graphics::HostCellSize::from_terminal(area);
+                        let observed_cell_size =
+                            crate::kitty_graphics::HostCellSize::try_from_terminal(area);
+                        if let Some(observed_cell_size) = observed_cell_size {
+                            self.state.host_cell_size = observed_cell_size;
+                        }
+                        cell_size = observed_cell_size.unwrap_or_else(|| {
+                            crate::kitty_graphics::HostCellSize::fallback_for_area(area)
+                        });
                         crate::ui::compute_view_with_cell_size(
                             &mut self.state,
                             &self.terminal_runtimes,
@@ -1024,7 +1087,7 @@ impl App {
                 }
                 self.sync_pending_agent_resume_deadline(now);
                 if self.start_pending_agent_resumes(self.pending_agent_resume_due(now)) {
-                    self.render_dirty.store(true, Ordering::Release);
+                    self.render_dirty.request_generic();
                     self.render_notify.notify_one();
                 }
                 self.last_render_at = Some(now);
@@ -1056,8 +1119,9 @@ impl App {
             match event {
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
-                    self.handle_internal_event_with_prefix_sync(ev);
-                    needs_render = true;
+                    if self.handle_internal_event_with_prefix_sync(ev) {
+                        needs_render = true;
+                    }
                 }
                 LoopEvent::Api(msg) => {
                     if self.handle_api_request_message(*msg) {
@@ -1073,7 +1137,7 @@ impl App {
                     self.input_rx = None;
                 }
                 LoopEvent::RenderRequested => {
-                    if self.render_dirty.load(Ordering::Acquire) {
+                    if self.render_dirty.is_pending() {
                         needs_render = true;
                     }
                 }
@@ -1088,6 +1152,16 @@ impl App {
         Ok(())
     }
 
+    fn sync_host_keyboard_report_all(&self, active: &mut bool) -> io::Result<()> {
+        let desired = self.host_keyboard_report_all_requested();
+        if desired == *active {
+            return Ok(());
+        }
+        crate::terminal_modes::set_host_kitty_keyboard_report_all(&mut io::stdout(), desired)?;
+        *active = desired;
+        Ok(())
+    }
+
     fn sync_host_mouse_capture(&self, active: &mut bool) -> io::Result<()> {
         let desired = self
             .state
@@ -1095,6 +1169,7 @@ impl App {
         if desired == *active {
             return Ok(());
         }
+        crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
         if desired {
             execute!(io::stdout(), EnableMouseCapture)?;
         } else {
@@ -1105,7 +1180,10 @@ impl App {
     }
 
     pub(crate) fn ensure_default_workspace(&mut self) -> bool {
-        if !self.state.workspaces.is_empty() || self.state.mode == Mode::Onboarding {
+        if !self.state.workspaces.is_empty()
+            || self.state.mode == Mode::Onboarding
+            || self.state.pending_workspace_create_cwd.is_some()
+        {
             return false;
         }
 
@@ -1325,16 +1403,8 @@ impl App {
             // On `min > max`, treat the entire `[ui]` section as invalid: keep
             // the previous settings and skip the section so the re-clamp below
             // — and every subsequent render/drag — can never panic.
-            if crate::config::validated_sidebar_bounds(
-                config.ui.sidebar_min_width,
-                config.ui.sidebar_max_width,
-            )
-            .is_none()
-            {
-                diagnostics.push(format!(
-                    "ui.sidebar_min_width ({}) is greater than sidebar_max_width ({}); keeping previous [ui] settings",
-                    config.ui.sidebar_min_width, config.ui.sidebar_max_width,
-                ));
+            if let Some(diagnostic) = config.invalid_sidebar_bounds_diagnostic() {
+                diagnostics.push(format!("{diagnostic}; keeping previous [ui] settings"));
             } else {
                 diagnostics.extend(config.ui.sound.diagnostics());
 
@@ -1353,22 +1423,32 @@ impl App {
                     .sidebar_width
                     .clamp(self.state.sidebar_min_width, self.state.sidebar_max_width);
                 self.state.mouse_capture = config.ui.mouse_capture;
+                self.state.copy_on_select = config.ui.copy_on_select;
                 if self.state.redraw_on_focus_gained != config.ui.redraw_on_focus_gained {
                     self.state.request_client_config_reload = true;
                 }
                 self.state.redraw_on_focus_gained = config.ui.redraw_on_focus_gained;
+                if self.loaded_host_cursor != config.ui.host_cursor {
+                    self.state.request_client_config_reload = true;
+                }
+                self.loaded_host_cursor = config.ui.host_cursor;
                 self.state.mouse_scroll_lines = config.ui.mouse_scroll_lines();
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
+                self.state.prompt_new_workspace_name = config.ui.prompt_new_workspace_name;
                 self.state.pane_borders = config.ui.pane_borders;
+                self.state.pane_scrollbars = config.ui.pane_scrollbars;
                 self.state.pane_gaps = config.ui.pane_gaps;
                 self.state.show_agent_labels_on_pane_borders =
                     config.ui.show_agent_labels_on_pane_borders;
                 self.state.hide_tab_bar_when_single_tab = config.ui.hide_tab_bar_when_single_tab;
+                self.state.tab_bar_position = config.ui.tab_bar_position;
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
+                self.state.sidebar_agents = config.ui.sidebar.agents.clone();
+                self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
                 self.state.agent_panel_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
@@ -1385,6 +1465,9 @@ impl App {
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
+                self.state.pane_graphics_layers.clear();
+                self.state.pane_graphics_streams.clear();
+                self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             }
             self.state.reveal_hidden_cursor_for_cjk_ime =
                 config.experimental.reveal_hidden_cursor_for_cjk_ime;
@@ -1497,6 +1580,73 @@ impl App {
 // ---------------------------------------------------------------------------
 
 impl App {
+    pub(crate) fn terminal_input_context(&self) -> Option<TerminalInputContext> {
+        if let Some(popup) = &self.state.popup_pane {
+            Some(TerminalInputContext::Popup(popup.terminal_id.clone()))
+        } else if self.state.mode == Mode::Terminal {
+            Some(TerminalInputContext::Pane)
+        } else {
+            None
+        }
+    }
+
+    fn execute_repeat_plan_headless(
+        &mut self,
+        source_id: InputSourceId,
+        lease_key: input::InputLeaseKey,
+        key: crate::input::TerminalKey,
+        plan: input::RepeatPlan,
+    ) {
+        match plan {
+            input::RepeatPlan::Forwarded(target) => {
+                if !self.forward_terminal_key_to_target_headless(&target, key) {
+                    self.input_leases.remove(&lease_key);
+                }
+            }
+            input::RepeatPlan::Reprocess {
+                context,
+                repetitions,
+                tracked,
+            } => {
+                let key = key
+                    .with_kind(crossterm::event::KeyEventKind::Repeat)
+                    .with_repeat_count(1);
+                let mut forwarded_target = None;
+                for _ in 0..repetitions {
+                    if let Some(target) = &forwarded_target {
+                        if !self.forward_terminal_key_to_target_headless(target, key.clone()) {
+                            self.input_leases.remove(&lease_key);
+                            break;
+                        }
+                        continue;
+                    }
+                    let current_context = self.terminal_input_context();
+                    if !self.input_leases.reprocess_allowed(
+                        lease_key,
+                        &context,
+                        current_context.as_ref(),
+                        tracked,
+                    ) {
+                        break;
+                    }
+                    if let Some(target) =
+                        self.handle_terminal_key_headless_from(source_id, key.clone())
+                    {
+                        if tracked {
+                            self.input_leases.insert_forwarded(
+                                lease_key,
+                                target.clone(),
+                                key.clone(),
+                            );
+                            forwarded_target = Some(target);
+                        }
+                    }
+                }
+            }
+            input::RepeatPlan::Ignore => {}
+        }
+    }
+
     /// Routes raw input bytes from a client through the existing input pipeline.
     ///
     /// The input bytes are parsed into `RawInputEvent`s and then processed.
@@ -1515,45 +1665,71 @@ impl App {
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
     ) {
+        self.route_client_events_from(LOCAL_INPUT_SOURCE, events, apply_host_terminal_theme);
+    }
+
+    pub(crate) fn route_client_events_from(
+        &mut self,
+        source_id: InputSourceId,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        apply_host_terminal_theme: bool,
+    ) {
         for event in events {
             let previous_mode = self.state.mode;
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
-                    let key_id = repeat_key_identity(&key);
+                    let lease_key = input::InputLeaseKey::new(source_id, &key);
+                    let key = self.input_leases.normalize_press(&lease_key, key);
                     match key.kind {
                         crossterm::event::KeyEventKind::Press => {
-                            if self.state.mode == Mode::Terminal {
-                                self.suppressed_repeat_keys.remove(&key_id);
-                                self.handle_terminal_key_headless(key);
+                            let initial_context = self.terminal_input_context();
+                            let target = if initial_context.is_some() {
+                                self.handle_terminal_key_headless_from(source_id, key.clone())
                             } else {
-                                self.suppressed_repeat_keys.insert(key_id);
-                                self.handle_non_terminal_key_headless(key);
-                            }
+                                self.handle_non_terminal_key_headless(key.clone());
+                                None
+                            };
+                            let resulting_context = self.terminal_input_context();
+                            let plan = self.input_leases.complete_press(
+                                lease_key,
+                                &key,
+                                initial_context.as_ref(),
+                                resulting_context.as_ref(),
+                                target,
+                            );
+                            self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
                         }
                         crossterm::event::KeyEventKind::Repeat => {
-                            if self.state.mode == Mode::Terminal
-                                && !self.suppressed_repeat_keys.contains(&key_id)
-                            {
-                                self.handle_terminal_key_headless(key);
-                            }
-                            // Repeats in non-terminal modes are ignored
-                            // (same as monolithic behavior).
+                            let current_context = self.terminal_input_context();
+                            let plan = self.input_leases.plan_repeat(
+                                lease_key,
+                                &key,
+                                current_context.as_ref(),
+                            );
+                            self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
                         }
                         crossterm::event::KeyEventKind::Release => {
-                            self.suppressed_repeat_keys.remove(&key_id);
+                            if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
+                                let _ = self
+                                    .forward_terminal_key_to_target_headless(&lease.target, key);
+                            }
                         }
                     }
                 }
+                crate::raw_input::RawInputEvent::Text(text) => {
+                    self.handle_text_commit_headless(text.as_str());
+                }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
-                    if self.state.mouse_capture {
-                        self.handle_mouse_event_headless(mouse);
+                    if self.state.popup_pane.is_some() || self.state.mouse_capture {
+                        self.handle_mouse_event_headless(source_id, mouse);
                     } else {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
-                    if self.state.mode != Mode::Terminal {
+                    if self.try_route_paste_to_popup(&text) {
+                    } else if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
                     } else {
                         if let Some(ws_idx) = self.state.active {
@@ -1564,28 +1740,28 @@ impl App {
                                         ws_idx,
                                         focused,
                                     ) {
-                                        let _ = runtime.try_send_bytes(bytes::Bytes::from(
-                                            if runtime
-                                                .input_state()
-                                                .map(|s| s.bracketed_paste)
-                                                .unwrap_or(false)
-                                            {
-                                                format!("\x1b[200~{text}\x1b[201~")
-                                            } else {
-                                                text
-                                            },
-                                        ));
+                                        let _ = runtime.try_send_paste(text);
                                     }
                                 }
                             }
                         }
                     }
                 }
-                crate::raw_input::RawInputEvent::OuterFocusGained
-                | crate::raw_input::RawInputEvent::OuterFocusLost => {}
+                crate::raw_input::RawInputEvent::OuterFocusGained => {
+                    self.send_outer_focus_event(crate::ghostty::FocusEvent::Gained);
+                }
+                crate::raw_input::RawInputEvent::OuterFocusLost => {
+                    self.release_input_source_headless(source_id);
+                    self.send_outer_focus_event(crate::ghostty::FocusEvent::Lost);
+                }
                 crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
                     if apply_host_terminal_theme {
                         self.update_host_terminal_theme(kind, color);
+                    }
+                }
+                crate::raw_input::RawInputEvent::HostPaletteColors { colors } => {
+                    if apply_host_terminal_theme {
+                        self.update_host_terminal_palette_colors(&colors);
                     }
                 }
                 crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
@@ -1593,10 +1769,15 @@ impl App {
                         self.set_host_terminal_appearance(appearance, true);
                     }
                 }
+                crate::raw_input::RawInputEvent::HostCellSizeReport { .. } => {}
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
             self.sync_prefix_input_source(previous_mode);
         }
+    }
+
+    pub(crate) fn clear_input_source(&mut self, source_id: InputSourceId) {
+        self.release_input_source_headless(source_id);
     }
 
     /// Handles a key event in non-terminal mode for the headless server.
@@ -1646,7 +1827,7 @@ impl App {
                 self.handle_context_menu_key_via_api(key_event);
             }
             Mode::KeybindHelp => {
-                input::handle_keybind_help_key(&mut self.state, key_event);
+                input::handle_keybind_help_key(&mut self.state, key);
             }
             Mode::GlobalMenu => {
                 input::handle_global_menu_key(&mut self.state, key_event);
@@ -1677,8 +1858,12 @@ impl App {
     /// Delegates to the same mouse handling logic used in the monolithic
     /// mode (hit-testing against the rendered UI), which works because
     /// the server's AppState maintains view geometry from virtual rendering.
-    fn handle_mouse_event_headless(&mut self, mouse: crossterm::event::MouseEvent) {
-        self.handle_mouse(mouse);
+    fn handle_mouse_event_headless(
+        &mut self,
+        source_id: InputSourceId,
+        mouse: crossterm::event::MouseEvent,
+    ) {
+        self.handle_mouse_from_input_source(source_id, mouse);
     }
 }
 
@@ -1704,6 +1889,94 @@ mod tests {
         )
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_repeats_and_releases_follow_the_pressed_pane() {
+        let record = crate::input::WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 27,
+            virtual_scan_code: 1,
+            unicode: 27,
+            control_key_state: 0,
+        };
+        let key = crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty())
+            .with_windows_record(record);
+        let enhanced = crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty())
+            .with_windows_record(crate::input::WindowsKeyRecord {
+                control_key_state: 0x0100,
+                ..record
+            });
+        assert_ne!(
+            input::InputLeaseKey::new(7, &key),
+            input::InputLeaseKey::new(7, &enhanced)
+        );
+
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let pressed_pane = workspace.focused_pane_id().unwrap();
+        let other_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(pressed_pane);
+        let (pressed_runtime, mut pressed_rx) =
+            TerminalRuntime::test_with_channel_capacity(80, 24, 6);
+        let (other_runtime, mut other_rx) = TerminalRuntime::test_with_channel_capacity(80, 24, 6);
+        workspace.tabs[0]
+            .runtimes
+            .insert(pressed_pane, pressed_runtime);
+        workspace.tabs[0].runtimes.insert(other_pane, other_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let release = crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::empty())
+            .with_windows_record(crate::input::WindowsKeyRecord {
+                key_down: false,
+                repeat_count: 1,
+                unicode: 0,
+                ..record
+            })
+            .with_kind(KeyEventKind::Release);
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(key.clone())],
+            false,
+        );
+        assert!(app.state.focus_pane_in_workspace(0, other_pane));
+        app.route_client_events(
+            vec![
+                crate::raw_input::RawInputEvent::Key(key.clone()),
+                crate::raw_input::RawInputEvent::Key(key.clone().with_kind(KeyEventKind::Repeat)),
+                crate::raw_input::RawInputEvent::Key(release),
+                crate::raw_input::RawInputEvent::Key(key.clone()),
+                crate::raw_input::RawInputEvent::OuterFocusLost,
+            ],
+            false,
+        );
+
+        for _ in 0..3 {
+            assert_eq!(
+                pressed_rx.try_recv().unwrap(),
+                bytes::Bytes::from_static(b"\x1b[27;1;27;1;0;1_")
+            );
+        }
+        assert_eq!(
+            pressed_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[27;1;0;0;0;1_")
+        );
+        assert!(pressed_rx.try_recv().is_err());
+
+        assert_eq!(
+            other_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[27;1;27;1;0;1_")
+        );
+        assert_eq!(
+            other_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[27;1;27;0;0;1_")
+        );
+        assert!(other_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
     fn release_notes_state() -> state::ReleaseNotesState {
         state::ReleaseNotesState {
             version: "0.1.0".into(),
@@ -1722,6 +1995,14 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("herdr-{name}-{}-{stamp}", std::process::id()))
     }
 
     #[cfg(windows)]
@@ -1773,83 +2054,171 @@ mod tests {
         }
     }
 
+    /// Drain the app event channel, returning the `active` flags of any emitted
+    /// `PrefixInputSource` events (the host-local input-source intents).
+    fn drained_prefix_active(app: &mut App) -> Vec<bool> {
+        let mut out = Vec::new();
+        while let Ok(ev) = app.event_rx.try_recv() {
+            if let crate::events::AppEvent::PrefixInputSource { active } = ev {
+                out.push(active);
+            }
+        }
+        out
+    }
+
     #[test]
-    fn sync_prefix_input_source_switches_then_restores_when_enabled() {
+    fn sync_prefix_input_source_emits_switch_then_restore_when_enabled() {
         let mut app = test_app();
         app.state.switch_ascii_input_source_in_prefix = true;
+
+        // Terminal -> Prefix emits the ASCII-switch intent.
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_input_source(Mode::Terminal);
+        assert_eq!(drained_prefix_active(&mut app), vec![true]);
+
+        // Prefix -> Terminal emits the restore intent.
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_input_source(Mode::Prefix);
+        assert_eq!(drained_prefix_active(&mut app), vec![false]);
+    }
+
+    #[test]
+    fn sync_prefix_input_source_does_not_emit_switch_when_flag_disabled() {
+        let mut app = test_app();
+        app.state.switch_ascii_input_source_in_prefix = false;
+
+        // Entering the realm with the flag off emits nothing.
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_input_source(Mode::Terminal);
+        assert!(drained_prefix_active(&mut app).is_empty());
+
+        // Leaving the realm still emits the restore (harmless if nothing was switched), so a
+        // mid-interaction flag toggle can't strand the host on ASCII.
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_input_source(Mode::Prefix);
+        assert_eq!(drained_prefix_active(&mut app), vec![false]);
+    }
+
+    #[test]
+    fn mode_wants_ascii_input_classification() {
+        // Allowlist: the prefix command/navigation realm wants ASCII.
+        for mode in [
+            Mode::Prefix,
+            Mode::Navigate,
+            Mode::Navigator,
+            Mode::Copy,
+            Mode::Resize,
+            Mode::ConfirmClose,
+            Mode::ConfirmRemoveWorktree,
+            Mode::ContextMenu,
+            Mode::GlobalMenu,
+            Mode::KeybindHelp,
+        ] {
+            assert!(mode.wants_ascii_input(), "{mode:?} should want ASCII");
+        }
+        // Everything else (terminal, text entry, startup overlays) keeps the user's IME.
+        for mode in [
+            Mode::Terminal,
+            Mode::RenameWorkspace,
+            Mode::RenameTab,
+            Mode::RenamePane,
+            Mode::NewLinkedWorktree,
+            Mode::OpenExistingWorktree,
+            Mode::Settings,
+            Mode::Onboarding,
+            Mode::ReleaseNotes,
+            Mode::ProductAnnouncement,
+        ] {
+            assert!(!mode.wants_ascii_input(), "{mode:?} should keep the IME");
+        }
+    }
+
+    #[test]
+    fn sync_prefix_input_source_keeps_realm_across_multi_level_prefix_commands() {
+        let mut app = test_app();
+        app.state.switch_ascii_input_source_in_prefix = true;
+
+        // Terminal -> Prefix switches once.
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_input_source(Mode::Terminal);
+        assert_eq!(drained_prefix_active(&mut app), vec![true]);
+
+        // Prefix -> sub-mode and sub-mode -> sub-mode stay in the realm: no emit.
+        app.state.mode = Mode::Navigator;
+        app.sync_prefix_input_source(Mode::Prefix);
+        app.state.mode = Mode::Resize;
+        app.sync_prefix_input_source(Mode::Navigator);
+        assert!(
+            drained_prefix_active(&mut app).is_empty(),
+            "must not switch or restore while still in the realm"
+        );
+
+        // Leaving the realm back to the terminal restores.
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_input_source(Mode::Resize);
+        assert_eq!(drained_prefix_active(&mut app), vec![false]);
+    }
+
+    #[test]
+    fn sync_prefix_input_source_restores_when_entering_rename_text_mode() {
+        let mut app = test_app();
+        app.state.switch_ascii_input_source_in_prefix = true;
+
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_input_source(Mode::Terminal);
+        assert_eq!(drained_prefix_active(&mut app), vec![true]);
+
+        // Prefix -> RenameTab leaves the realm (text entry wants the IME): restore.
+        app.state.mode = Mode::RenameTab;
+        app.sync_prefix_input_source(Mode::Prefix);
+        assert_eq!(drained_prefix_active(&mut app), vec![false]);
+    }
+
+    #[test]
+    fn handle_internal_event_prefix_input_source_applies_switch_and_restore() {
+        // The monolithic (in-process) path applies the host switch when it consumes the event.
+        let mut app = test_app();
         let fake = FakePrefixInputSource::switching();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
         app.set_prefix_input_source(Box::new(fake));
 
-        // Terminal -> Prefix should switch to ASCII.
-        app.state.mode = Mode::Prefix;
-        app.sync_prefix_input_source(Mode::Terminal);
+        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: true });
         assert_eq!(switch_calls.get(), 1);
         assert_eq!(restore_calls.get(), 0);
 
-        // Prefix -> Terminal should restore the saved source.
-        app.state.mode = Mode::Terminal;
-        app.sync_prefix_input_source(Mode::Prefix);
-        assert_eq!(switch_calls.get(), 1);
+        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: false });
         assert_eq!(restore_calls.get(), 1);
     }
 
     #[test]
-    fn sync_prefix_input_source_is_noop_when_flag_disabled() {
+    fn handle_internal_event_prefix_input_source_restore_is_safe_when_switch_was_noop() {
+        // Already-ASCII / failed-switch case: the restore on leave must stay harmless.
         let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = false;
-        let fake = FakePrefixInputSource::switching();
-        let switch_calls = fake.switch_calls.clone();
-        let restore_calls = fake.restore_calls.clone();
-        app.set_prefix_input_source(Box::new(fake));
-
-        app.state.mode = Mode::Prefix;
-        app.sync_prefix_input_source(Mode::Terminal);
-        app.state.mode = Mode::Terminal;
-        app.sync_prefix_input_source(Mode::Prefix);
-
-        assert_eq!(switch_calls.get(), 0);
-        assert_eq!(restore_calls.get(), 0);
-    }
-
-    #[test]
-    fn sync_prefix_input_source_restore_is_safe_when_switch_was_noop() {
-        // Simulates the already-ASCII / failed-switch case: switch reports no
-        // change, and the later restore on leave must stay harmless.
-        let mut app = test_app();
-        app.state.switch_ascii_input_source_in_prefix = true;
         let fake = FakePrefixInputSource::no_op();
         let switch_calls = fake.switch_calls.clone();
         let restore_calls = fake.restore_calls.clone();
         app.set_prefix_input_source(Box::new(fake));
 
-        app.state.mode = Mode::Prefix;
-        app.sync_prefix_input_source(Mode::Terminal);
-        app.state.mode = Mode::Terminal;
-        app.sync_prefix_input_source(Mode::Prefix);
-
+        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: true });
+        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: false });
         assert_eq!(switch_calls.get(), 1);
         assert_eq!(restore_calls.get(), 0);
     }
 
     #[tokio::test]
-    async fn raw_input_dispatch_restores_input_source_when_leaving_prefix() {
-        // Leaving prefix mode happens inside the raw-input dispatch, not in
-        // `handle_key` itself — the sync must sit at the dispatch layer so any
-        // event that exits prefix (here Esc) still restores the host source.
+    async fn raw_input_dispatch_emits_input_source_intent_when_leaving_prefix() {
+        // Leaving prefix mode happens inside the raw-input dispatch, not in `handle_key` itself —
+        // the sync must sit at the dispatch layer so any event that exits prefix (here Esc) still
+        // emits the restore intent.
         let mut app = test_app();
         app.state.switch_ascii_input_source_in_prefix = true;
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        let fake = FakePrefixInputSource::switching();
-        let switch_calls = fake.switch_calls.clone();
-        let restore_calls = fake.restore_calls.clone();
-        app.set_prefix_input_source(Box::new(fake));
 
-        // ctrl+b (the default prefix key) enters prefix mode → switch edge.
+        // ctrl+b (the default prefix key) enters prefix mode → switch intent.
         app.handle_raw_input_event(raw_key(
             KeyCode::Char('b'),
             KeyModifiers::CONTROL,
@@ -1857,11 +2226,9 @@ mod tests {
         ))
         .await;
         assert_eq!(app.state.mode, Mode::Prefix);
-        assert_eq!(switch_calls.get(), 1);
-        assert_eq!(restore_calls.get(), 0);
+        assert_eq!(drained_prefix_active(&mut app), vec![true]);
 
-        // Esc leaves prefix mode → restore edge, even though the exit is decided
-        // below `handle_key`.
+        // Esc leaves prefix mode → restore intent.
         app.handle_raw_input_event(raw_key(
             KeyCode::Esc,
             KeyModifiers::empty(),
@@ -1869,7 +2236,7 @@ mod tests {
         ))
         .await;
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert_eq!(restore_calls.get(), 1);
+        assert_eq!(drained_prefix_active(&mut app), vec![false]);
     }
 
     fn config_env_lock() -> &'static Mutex<()> {
@@ -1906,6 +2273,20 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_git_status_event_has_no_render_impact() {
+        let mut app = test_app();
+        app.git_refresh_in_flight = true;
+
+        let changed = app.handle_internal_event_with_prefix_sync(AppEvent::GitStatusRefreshed {
+            results: Vec::new(),
+            cache_updates: Vec::new(),
+        });
+
+        assert!(!changed);
+        assert!(!app.git_refresh_in_flight);
+    }
+
+    #[test]
     fn git_status_event_clears_in_flight_refresh() {
         let mut app = test_app();
         app.git_refresh_in_flight = true;
@@ -1925,14 +2306,17 @@ mod tests {
     fn git_status_event_marks_render_dirty_when_status_changes() {
         let mut app = test_app();
         app.state.workspaces.push(Workspace::test_new("one"));
-        app.render_dirty.store(false, Ordering::Release);
+        let _ = app.render_dirty.take();
         let workspace_id = app.state.workspaces[0].id.clone();
         let resolved_identity_cwd = app.state.workspaces[0].resolved_identity_cwd().unwrap();
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
             results: vec![crate::workspace::WorkspaceGitStatus {
                 workspace_id,
-                resolved_identity_cwd,
+                resolved_identity_cwd: resolved_identity_cwd.clone(),
+                status_cache_key: resolved_identity_cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "one".into(),
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
                 space: None,
@@ -1940,7 +2324,7 @@ mod tests {
             cache_updates: Vec::new(),
         });
 
-        assert!(app.render_dirty.load(Ordering::Acquire));
+        assert!(app.render_dirty.is_pending());
     }
 
     #[test]
@@ -2163,6 +2547,21 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_git_status_drain_has_no_render_impact() {
+        let mut app = test_app();
+        app.git_refresh_in_flight = true;
+        app.event_tx
+            .try_send(AppEvent::GitStatusRefreshed {
+                results: Vec::new(),
+                cache_updates: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(!app.drain_internal_events());
+        assert!(!app.git_refresh_in_flight);
+    }
+
+    #[test]
     fn internal_event_drain_limits_work_per_tick() {
         let mut app = test_app();
         for i in 0..=APP_EVENT_DRAIN_LIMIT {
@@ -2225,6 +2624,17 @@ mod tests {
     }
 
     #[test]
+    fn startup_uses_configured_sidebar_state() {
+        let mut config = Config::default();
+        config.ui.sidebar_start_collapsed = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.state.sidebar_collapsed);
+    }
+
+    #[test]
     fn startup_uses_redraw_on_focus_gained_config() {
         let mut config = Config::default();
         config.ui.redraw_on_focus_gained = false;
@@ -2233,6 +2643,34 @@ mod tests {
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         assert!(!app.state.redraw_on_focus_gained);
+    }
+
+    #[test]
+    fn workspace_name_prompt_suppresses_default_creation_while_pending() {
+        let mut app = test_app();
+        app.state.prompt_new_workspace_name = true;
+
+        app.begin_tui_workspace_create("test.workspace.create");
+
+        assert_eq!(app.state.mode, Mode::RenameWorkspace);
+        assert!(app.state.pending_workspace_create_cwd.is_some());
+        assert!(!app.ensure_default_workspace());
+        assert!(app.state.workspaces.is_empty());
+
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.state.workspaces.is_empty());
+        assert!(app.state.pending_workspace_create_cwd.is_none());
+    }
+
+    #[test]
+    fn startup_uses_workspace_name_prompt_config() {
+        let mut config = Config::default();
+        config.ui.prompt_new_workspace_name = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.state.prompt_new_workspace_name);
     }
 
     #[test]
@@ -2421,12 +2859,35 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_scope = \"current\"\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\nright_click_passthrough_modifier = \"ctrl\"\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nprompt_new_workspace_name = true\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
+        let selection_pane = crate::layout::PaneId::alloc();
+        app.state.selection = Some(crate::selection::Selection::range(
+            selection_pane,
+            0,
+            0,
+            1,
+            None,
+        ));
+        app.state.selection_autoscroll = Some(state::SelectionAutoscroll {
+            direction: state::SelectionAutoscrollDirection::Down,
+            last_mouse_screen_col: 1,
+            last_mouse_screen_row: 1,
+            inner_rect: ratatui::layout::Rect::new(0, 0, 2, 2),
+        });
+        let selection_deadline = Instant::now();
+        app.selection_autoscroll_deadline = Some(selection_deadline);
+        app.selection_highlight_clear_deadline = Some(selection_deadline);
+        app.last_pane_click = Some(PaneClickState {
+            pane_id: selection_pane,
+            viewport_row: 0,
+            col: 0,
+            at: selection_deadline,
+        });
         app.next_auto_update_check = Some(Instant::now());
         app.next_agent_manifest_update_check = Some(Instant::now());
         let report = app.reload_config();
@@ -2445,6 +2906,28 @@ mod tests {
         );
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
         assert!(!app.state.redraw_on_focus_gained);
+        assert!(!app.state.copy_on_select);
+        assert!(app.state.prompt_new_workspace_name);
+        assert!(app.state.selection.is_some());
+        assert!(app.state.selection_autoscroll.is_some());
+        assert_eq!(app.selection_autoscroll_deadline, Some(selection_deadline));
+        assert_eq!(
+            app.selection_highlight_clear_deadline,
+            Some(selection_deadline)
+        );
+        assert!(app.last_pane_click.is_some());
+
+        app.state.mode = Mode::Copy;
+        app.state.selection = Some(crate::selection::Selection::range(
+            selection_pane,
+            0,
+            0,
+            1,
+            None,
+        ));
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.selection.is_some());
         assert_eq!(
             app.state.right_click_passthrough_modifiers,
             Some(KeyModifiers::CONTROL)
@@ -2469,6 +2952,30 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_requests_client_reload_for_host_cursor_only_change() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-host-cursor");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[ui]\nhost_cursor = \"native\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.state.request_client_config_reload = false;
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            app.loaded_host_cursor,
+            crate::config::HostCursorModeConfig::Native
+        );
+        assert!(app.state.request_client_config_reload);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -2500,6 +3007,80 @@ mod tests {
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(app.state.default_sidebar_width, 35);
         assert_eq!(app.state.sidebar_width, 31);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_updates_sidebar_token_rows() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-sidebar-tokens");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+
+        std::fs::write(
+            &path,
+            "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"$summary\"]]\nrow_gap = 1\n\n[ui.sidebar.agents.rows_by_agent]\nclaude = [[\"terminal_title_stripped\"]]\n\n[ui.sidebar.spaces]\nrows = [[\"workspace\", \"$jj_status\"]]\nrow_gap = 3\n",
+        )
+        .unwrap();
+        app.state.agent_panel_scroll = 5;
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+        assert_eq!(
+            app.state.sidebar_agents.rows,
+            vec![vec![
+                crate::config::AgentSidebarToken::StateIcon,
+                crate::config::AgentSidebarToken::Custom("summary".into()),
+            ]]
+        );
+        assert_eq!(
+            app.state.sidebar_agents.rows_by_agent["claude"],
+            vec![vec![
+                crate::config::AgentSidebarToken::TerminalTitleStripped,
+            ]]
+        );
+        assert_eq!(app.state.sidebar_agents.row_gap, 1);
+        assert_eq!(
+            app.state.sidebar_spaces.rows,
+            vec![vec![
+                crate::config::SpaceSidebarToken::Workspace,
+                crate::config::SpaceSidebarToken::Custom("jj_status".into()),
+            ]]
+        );
+        assert_eq!(app.state.sidebar_spaces.row_gap, 3);
+
+        let previous_agents = app.state.sidebar_agents.clone();
+        std::fs::write(
+            &path,
+            "[ui.sidebar.agents]\nrows = [[\"agent\"]]\n\n[ui.sidebar.agents.rows_by_agent]\nclaude-code = [[\"terminal_title\"]]\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(app.state.sidebar_agents, previous_agents);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_does_not_reset_sidebar_to_startup_state() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-sidebar-start-collapsed");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(!app.state.sidebar_collapsed);
+
+        std::fs::write(&path, "[ui]\nsidebar_start_collapsed = true\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(!app.state.sidebar_collapsed);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -2651,21 +3232,21 @@ mod tests {
 
         let report = app.reload_config();
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("sidebar_min_width")
+                && diagnostic.contains("sidebar_max_width")
+                && diagnostic.contains("greater")
+        }));
         assert_eq!(app.state.sidebar_min_width, original_min);
         assert_eq!(app.state.sidebar_max_width, original_max);
         assert_eq!(
             app.state.mouse_capture, original_mouse_capture,
             "[ui] is treated as invalid on bad bounds; mouse_capture must not apply"
         );
-        assert!(app
-            .state
-            .config_diagnostic
-            .as_deref()
-            .is_some_and(|message| {
-                message.contains("sidebar_min_width")
-                    && message.contains("sidebar_max_width")
-                    && message.contains("greater")
-            }));
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some("config.toml; herdr config check")
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -2688,6 +3269,9 @@ mod tests {
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("keys.new_workspace") && diagnostic.contains("disabling binding")
+        }));
         assert_eq!(
             (app.state.prefix_code, app.state.prefix_mods),
             original_prefix
@@ -2697,13 +3281,37 @@ mod tests {
             app.state.toast_config.delivery,
             crate::config::ToastDelivery::Terminal
         );
-        assert!(app
-            .state
-            .config_diagnostic
-            .as_deref()
-            .is_some_and(|message| {
-                message.contains("keys.new_workspace") && message.contains("disabling binding")
-            }));
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_applies_known_sibling_and_summarizes_unknown_key() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-unknown-key");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let target_mouse_capture = !app.state.mouse_capture;
+        std::fs::write(
+            &path,
+            format!("[ui]\nmouse_capture = {target_mouse_capture}\nmouse_captur = false\n"),
+        )
+        .unwrap();
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(
+            report.diagnostics,
+            vec!["unknown config key ui.mouse_captur; ignoring key"]
+        );
+        assert_eq!(app.state.mouse_capture, target_mouse_capture);
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some("config.toml has unknown keys; herdr config check")
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -2756,6 +3364,10 @@ mod tests {
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("invalid ui config")));
         assert!(app
             .state
             .keybinds
@@ -2765,12 +3377,6 @@ mod tests {
             app.state.toast_config.delivery,
             crate::config::ToastDelivery::Herdr
         );
-        assert!(app
-            .state
-            .config_diagnostic
-            .as_deref()
-            .is_some_and(|message| message.contains("invalid ui config")));
-
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -2794,6 +3400,10 @@ mod tests {
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("invalid terminal config")));
         assert_eq!(app.state.default_shell, original_default_shell);
         assert_eq!(app.state.shell_mode, original_shell_mode);
         assert_eq!(app.state.new_terminal_cwd, original_new_cwd);
@@ -2801,12 +3411,6 @@ mod tests {
             app.state.toast_config.delivery,
             crate::config::ToastDelivery::Terminal
         );
-        assert!(app
-            .state
-            .config_diagnostic
-            .as_deref()
-            .is_some_and(|message| message.contains("invalid terminal config")));
-
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -2862,31 +3466,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_save_pane_history_persists_then_applies_live_config() {
-        let _guard = config_env_lock().lock().unwrap();
-        let path = temp_config_path("settings-save-pane-history");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "onboarding = false\n").unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
-
-        let mut app = test_app();
-        assert!(!app.persist_pane_history);
-        assert!(!app.state.pane_history_persistence);
-
-        app.save_pane_history_persistence(true);
-
-        assert!(app.persist_pane_history);
-        assert!(app.state.pane_history_persistence);
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("[experimental]"));
-        assert!(content.contains("pane_history = true"));
-        assert!(app.state.config_diagnostic.is_none());
-
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-invalid-toml");
@@ -2912,7 +3491,7 @@ mod tests {
             .config_diagnostic
             .as_deref()
             .is_some_and(|message| {
-                message.contains("config parse error") && message.contains("keeping current config")
+                message == "config.toml invalid; keeping current config; herdr config check"
             }));
         assert!(app.state.toast.is_none());
 
@@ -2944,6 +3523,43 @@ mod tests {
             .await;
 
         assert!(handled);
+    }
+
+    #[tokio::test]
+    async fn monolithic_input_forwards_report_all_printable_event_kinds() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 4);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            app.handle_raw_input_event(raw_key(KeyCode::Char('j'), KeyModifiers::empty(), kind))
+                .await;
+        }
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:2u")
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3021,6 +3637,118 @@ mod tests {
         assert!(handled);
         assert_eq!(app.state.outer_terminal_focus, Some(true));
         assert!(!app.full_redraw_pending);
+    }
+
+    #[tokio::test]
+    async fn monolithic_outer_focus_events_reach_reporting_pane() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("focus-reporting");
+        let pane_id = workspace.tabs[0].root_pane;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                b"\x1b[?1004h",
+                4,
+            );
+        workspace.insert_test_runtime(pane_id, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        assert!(
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusGained)
+                .await
+        );
+        assert_eq!(
+            input_rx
+                .recv()
+                .await
+                .expect("forwarded focus gained report"),
+            bytes::Bytes::from_static(b"\x1b[I")
+        );
+
+        assert!(
+            !app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusLost)
+                .await
+        );
+        assert_eq!(
+            input_rx.recv().await.expect("forwarded focus lost report"),
+            bytes::Bytes::from_static(b"\x1b[O")
+        );
+    }
+
+    #[tokio::test]
+    async fn outer_focus_events_reconcile_pending_pane_focus() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("focus-transition");
+        let previous_pane = workspace.tabs[0].root_pane;
+        let next_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(previous_pane);
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                b"\x1b[?1004h",
+                4,
+            );
+        workspace.insert_test_runtime(next_pane, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.last_focus = Some((0, previous_pane));
+
+        assert!(app.state.focus_pane_in_workspace(0, next_pane));
+        assert!(
+            !app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusLost)
+                .await
+        );
+        app.sync_focus_events();
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[O")
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        assert!(app.state.focus_pane_in_workspace(0, previous_pane));
+        app.sync_focus_events();
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[O")
+        );
+
+        assert!(app.state.focus_pane_in_workspace(0, next_pane));
+        app.sync_focus_events();
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[O")
+        );
+
+        assert!(
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusGained)
+                .await
+        );
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[I")
+        );
+
+        assert!(app.state.focus_pane_in_workspace(0, previous_pane));
+        app.sync_focus_events();
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[O")
+        );
+        assert!(app.state.focus_pane_in_workspace(0, next_pane));
+        app.sync_focus_events();
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[I")
+        );
     }
 
     #[tokio::test]
@@ -3147,6 +3875,12 @@ mod tests {
                 amount: Some(0.05),
             }),
         };
+        let agent_view = crate::api::schema::Request {
+            id: "req_9".into(),
+            method: crate::api::schema::Method::AgentViewClear(
+                crate::api::schema::AgentViewClearParams::default(),
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -3156,6 +3890,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&pane_swap));
         assert!(crate::api::request_changes_ui(&pane_focus_direction));
         assert!(crate::api::request_changes_ui(&pane_resize));
+        assert!(crate::api::request_changes_ui(&agent_view));
     }
 
     #[test]
@@ -3385,7 +4120,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_target_resolves_terminal_id() {
+    fn terminal_and_agent_targets_treat_terminal_ids_differently() {
         let mut app = test_app();
         let workspace = Workspace::test_new("terminal-target-id");
         let pane = workspace.tabs[0].root_pane;
@@ -3395,19 +4130,54 @@ mod tests {
         app.state.selected = 0;
 
         let resolved = app.resolve_terminal_target(&terminal_id).unwrap();
-
-        assert_eq!(resolved.ws_idx, 0);
         assert_eq!(resolved.pane_id, pane);
         assert_eq!(resolved.terminal_id, terminal_id);
+
+        assert!(matches!(
+            app.resolve_agent_target(&resolved.terminal_id),
+            Err(crate::app::terminal_targets::TerminalTargetError::NotFound { .. })
+        ));
     }
 
     #[test]
-    fn terminal_target_resolves_legacy_pane_id() {
+    fn agent_target_rejects_a_pane_that_only_has_a_launch_command() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("terminal-target-command");
+        let pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .launch_argv = Some(vec!["just".into(), "dev".into()]);
+        let pane_id = app.public_pane_id(0, pane).unwrap();
+
+        assert!(app.resolve_terminal_target(&pane_id).is_ok());
+        assert!(matches!(
+            app.resolve_agent_target(&pane_id),
+            Err(crate::app::terminal_targets::TerminalTargetError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn terminal_target_resolves_pane_id_for_an_agent() {
         let mut app = test_app();
         let workspace = Workspace::test_new("terminal-target-pane");
         let pane = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane).unwrap().to_string();
         app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let attached_terminal_id = app.state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        app.state
+            .terminals
+            .get_mut(&attached_terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
         app.state.active = Some(0);
         app.state.selected = 0;
         let pane_id = app.public_pane_id(0, pane).unwrap();
@@ -3443,6 +4213,27 @@ mod tests {
 
         assert_eq!(resolved.pane_id, pane);
         assert_eq!(resolved.terminal_id, terminal_id);
+    }
+
+    #[test]
+    fn agent_target_treats_legacy_pane_syntax_as_a_name() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("agent-target-name");
+        let pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.set_agent_name("p_1".into());
+
+        let resolved = app.resolve_agent_target("p_1").unwrap();
+
+        assert_eq!(resolved.pane_id, pane);
+        assert_eq!(resolved.terminal_id, terminal_id.to_string());
     }
 
     #[test]
@@ -3751,42 +4542,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focused_agent_start_records_previous_pane() {
+    async fn unavailable_agent_start_does_not_mutate_topology() {
         let mut app = test_app();
-        let workspace = Workspace::test_new("agent-start-focus");
+        let workspace = Workspace::test_new("agent-start-target");
         let root = workspace.tabs[0].root_pane;
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
 
         let response = app.handle_api_request(crate::api::schema::Request {
-            id: "req_agent_start_focus".into(),
+            id: "req_agent_start_target".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
                 name: "worker".into(),
-                cwd: None,
-                workspace_id: None,
-                tab_id: None,
-                split: Some(crate::api::schema::SplitDirection::Right),
-                focus: true,
-                argv: vec![exiting_test_command().into()],
-                env: Default::default(),
+                kind: "pi".into(),
+                pane_id,
+                args: Vec::new(),
+                timeout_ms: Some(1_000),
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
-        assert_eq!(response["result"]["type"], "agent_started");
-        assert_ne!(app.state.workspaces[0].focused_pane_id(), Some(root));
-
-        app.state.last_pane();
-
-        assert_eq!(app.state.active, Some(0));
+        assert_eq!(response["error"]["code"], "agent_pane_unavailable");
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
+    }
 
-        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
-        for (_terminal_id, runtime) in runtimes {
-            runtime.shutdown();
-        }
+    #[tokio::test]
+    async fn failed_agent_start_input_rolls_back_and_can_retry() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("agent-start-input-failure");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_manual_label("shell".into());
+        let (runtime, mut receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime
+            .try_send_bytes(bytes::Bytes::from_static(b"occupied"))
+            .unwrap();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let request = || crate::api::schema::Request {
+            id: "req_agent_start_input".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                kind: "pi".into(),
+                pane_id: pane_id.clone(),
+                args: Vec::new(),
+                timeout_ms: Some(4_000),
+            }),
+        };
+        let response = app.handle_api_request(request());
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "agent_start_input_failed");
+        assert_eq!(app.state.terminals[&terminal_id].agent_name, None);
+        assert_eq!(
+            app.state.terminals[&terminal_id].manual_label.as_deref(),
+            Some("shell")
+        );
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"occupied")
+        );
+        let retry = app.handle_api_request(request());
+        let retry: serde_json::Value = serde_json::from_str(&retry).unwrap();
+        assert_eq!(retry["result"]["type"], "agent_started");
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_name.as_deref(),
+            Some("worker")
+        );
+        let rename = app.handle_api_request(crate::api::schema::Request {
+            id: "req_agent_rename_pending".into(),
+            method: crate::api::schema::Method::AgentRename(
+                crate::api::schema::AgentRenameParams {
+                    target: pane_id,
+                    name: Some("replacement".into()),
+                },
+            ),
+        });
+        let rename: serde_json::Value = serde_json::from_str(&rename).unwrap();
+        assert_eq!(rename["error"]["code"], "agent_launch_pending");
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_name.as_deref(),
+            Some("worker")
+        );
     }
 
     #[test]
@@ -3929,7 +4781,6 @@ mod tests {
         app.next_resize_poll = now - Duration::from_millis(1);
         app.config_diagnostic_deadline = None;
         app.toast_deadline = None;
-        app.next_animation_tick = None;
         app.next_auto_update_check = None;
         app.session_save_deadline = None;
         app.state.workspaces.clear();
@@ -3951,12 +4802,76 @@ mod tests {
     }
 
     #[test]
+    fn due_session_save_starts_background_writer() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("background-session-save");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+
+        let mut app = test_app();
+        app.no_session = false;
+        app.state.workspaces = vec![Workspace::test_new("autosave")];
+        app.state.ensure_test_terminals();
+        app.session_save_deadline = Some(Instant::now() - Duration::from_secs(1));
+
+        app.handle_scheduled_tasks(Instant::now(), false);
+
+        assert!(app.session_save_thread.is_some());
+        assert!(app.session_save_deadline.is_none());
+        app.save_session_now();
+        assert!(crate::session::data_dir().join("session.json").exists());
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn background_session_save_reschedules_when_writer_is_busy() {
+        let mut app = test_app();
+        app.no_session = false;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        app.session_save_thread = Some(std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        }));
+
+        app.start_background_session_save();
+
+        assert!(app.session_save_thread.is_some());
+        assert!(app.session_save_deadline.is_some());
+
+        release_tx.send(()).unwrap();
+        app.no_session = true;
+        app.save_session_now();
+    }
+
+    #[test]
+    fn final_session_save_joins_background_writer_before_returning() {
+        let mut app = test_app();
+        app.no_session = true;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        app.session_save_thread = Some(std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            done_tx.send(()).unwrap();
+        }));
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            release_tx.send(()).unwrap();
+        });
+
+        app.save_session_now();
+
+        releaser.join().unwrap();
+        done_rx.try_recv().unwrap();
+        assert!(app.session_save_thread.is_none());
+    }
+
+    #[test]
     fn next_loop_deadline_includes_selection_autoscroll_deadline() {
         let mut app = test_app();
         let now = Instant::now();
         app.next_resize_poll = now + Duration::from_millis(300);
         app.selection_autoscroll_deadline = Some(now + Duration::from_millis(5));
-        app.next_animation_tick = Some(now + Duration::from_millis(100));
         app.session_save_deadline = Some(now + Duration::from_millis(200));
         assert_eq!(
             app.next_loop_deadline(now, false),
@@ -4098,6 +5013,27 @@ mod tests {
             Mode::Terminal,
             "Esc should leave navigate mode and return to Terminal mode"
         );
+    }
+
+    #[test]
+    fn explicit_text_commit_does_not_trigger_navigate_binding() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.detach_exits = false;
+        app.state.mode = Mode::Navigate;
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("q"),
+            )],
+            false,
+        );
+
+        assert!(!app.state.detach_requested);
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert!(app.input_leases.is_empty());
     }
 
     #[test]
@@ -4256,12 +5192,558 @@ last_pane = "prefix+tab"
     }
 
     #[tokio::test]
-    async fn route_client_input_preserves_shift_enter_for_modify_other_keys_pane() {
+    async fn host_report_all_follows_terminal_protocol_and_command_modes() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, _rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 1);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        assert!(app.host_keyboard_report_all_requested());
+
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, focused)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[<u");
+        assert!(!app.host_keyboard_report_all_requested());
+
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, focused)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[>15u");
+        let other_pane = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let (other_runtime, _rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>7u", 1);
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(other_pane, other_runtime);
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(other_pane));
+        assert!(!app.host_keyboard_report_all_requested());
+
+        assert!(app.state.focus_pane_in_workspace(0, focused));
+        app.state.mode = Mode::Prefix;
+        assert!(app.host_keyboard_report_all_requested());
+        app.state.mode = Mode::Navigate;
+        assert!(app.host_keyboard_report_all_requested());
+        app.state.mode = Mode::RenameWorkspace;
+        assert!(!app.host_keyboard_report_all_requested());
+    }
+
+    #[tokio::test]
+    async fn route_client_input_forwards_report_all_printable_event_kinds() {
         let mut app = test_app();
         let mut workspace = Workspace::test_new("test");
         let focused = workspace.focused_pane_id().unwrap();
         let (runtime, mut rx) =
-            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>4;1m", 4);
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 4);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"\x1b[106u\x1b[106;1:2u\x1b[106;1:3u".to_vec());
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:2u")
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_text_commit_bypasses_bindings_leases_and_key_encoding() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 2);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("你🙂"),
+            )],
+            false,
+        );
+
+        assert_eq!(rx.recv().await.unwrap().as_ref(), "你🙂".as_bytes());
+        assert!(rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_ime_text_bypasses_report_all_key_encoding() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 2);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input("你".as_bytes().to_vec());
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static("你".as_bytes())
+        );
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_ascii_uppercase_bypasses_report_all_key_encoding() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 2);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"A".to_vec());
+
+        assert_eq!(rx.recv().await.unwrap(), bytes::Bytes::from_static(b"A"));
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_text_does_not_erase_owned_physical_key() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 4);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"\x1b[106u".to_vec());
+        app.route_client_input(b"j".to_vec());
+        app.route_client_input(b"\x1b[106;1:3u".to_vec());
+
+        assert_eq!(
+            rx.try_recv().expect("physical press"),
+            bytes::Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert_eq!(
+            rx.try_recv().expect("committed text"),
+            bytes::Bytes::from_static(b"j")
+        );
+        assert_eq!(
+            rx.try_recv().expect("physical release"),
+            bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outer_focus_loss_releases_owned_report_all_keys() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 3);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_events(
+            vec![
+                raw_key(
+                    KeyCode::Char('j'),
+                    KeyModifiers::empty(),
+                    KeyEventKind::Press,
+                ),
+                crate::raw_input::RawInputEvent::OuterFocusLost,
+            ],
+            false,
+        );
+
+        assert_eq!(
+            rx.try_recv().expect("forwarded press"),
+            bytes::Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert_eq!(
+            rx.try_recv().expect("synthetic release on focus loss"),
+            bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_input_source_releases_owned_report_all_keys() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 3);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_events_from(
+            42,
+            vec![raw_key(
+                KeyCode::Char('j'),
+                KeyModifiers::empty(),
+                KeyEventKind::Press,
+            )],
+            false,
+        );
+        app.clear_input_source(42);
+
+        assert_eq!(
+            rx.try_recv().expect("forwarded press"),
+            bytes::Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert_eq!(
+            rx.try_recv().expect("synthetic release on disconnect"),
+            bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn physical_count_one_repeats_and_release_keep_the_pressed_pane() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let pressed_pane = workspace.focused_pane_id().unwrap();
+        let other_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(pressed_pane);
+        let (pressed_runtime, mut pressed_rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 5);
+        let (other_runtime, mut other_rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 2);
+        workspace.tabs[0]
+            .runtimes
+            .insert(pressed_pane, pressed_runtime);
+        workspace.tabs[0].runtimes.insert(other_pane, other_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let record = crate::input::WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 65,
+            virtual_scan_code: 30,
+            unicode: 97,
+            control_key_state: 0,
+        };
+        let roundtrip = |events: Vec<crate::protocol::ClientInputEvent>| {
+            let message = crate::protocol::ClientMessage::InputEvents { events };
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            let (decoded, _): (crate::protocol::ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            let crate::protocol::ClientMessage::InputEvents { events } = decoded else {
+                panic!("expected structured input events");
+            };
+            events
+                .into_iter()
+                .map(|event| event.to_raw_input_event())
+                .collect()
+        };
+        let event = |kind, record| crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char('a'),
+            modifiers: 0,
+            kind,
+            repeat_count: 1,
+            generated_text: None,
+            source: crate::protocol::ClientKeySource::WindowsConsole { record },
+        };
+
+        app.route_client_events(
+            roundtrip(vec![event(crate::protocol::ClientKeyKind::Press, record)]),
+            false,
+        );
+        assert!(app.state.focus_pane_in_workspace(0, other_pane));
+        app.route_client_events(
+            roundtrip(vec![
+                event(crate::protocol::ClientKeyKind::Press, record),
+                event(crate::protocol::ClientKeyKind::Repeat, record),
+                event(
+                    crate::protocol::ClientKeyKind::Release,
+                    crate::input::WindowsKeyRecord {
+                        key_down: false,
+                        unicode: 0,
+                        ..record
+                    },
+                ),
+            ]),
+            false,
+        );
+
+        for expected in [
+            b"\x1b[97;1:1u".as_slice(),
+            b"\x1b[97;1:2u".as_slice(),
+            b"\x1b[97;1:2u".as_slice(),
+            b"\x1b[97;1:3u".as_slice(),
+        ] {
+            assert_eq!(pressed_rx.try_recv().unwrap().as_ref(), expected);
+        }
+        assert!(pressed_rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grouped_physical_press_and_runtime_loss_preserve_count_then_close_the_lease() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().unwrap();
+        let terminal_id = workspace.tabs[0].terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 2);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let record = crate::input::WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 3,
+            virtual_key_code: 65,
+            virtual_scan_code: 30,
+            unicode: 97,
+            control_key_state: 0,
+        };
+        let message = crate::protocol::ClientMessage::InputEvents {
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('a'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 3,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::WindowsConsole { record },
+            }],
+        };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+        let (decoded, _): (crate::protocol::ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        let crate::protocol::ClientMessage::InputEvents { events } = decoded else {
+            panic!("expected structured input events");
+        };
+
+        app.route_client_events(
+            events
+                .into_iter()
+                .map(|event| event.to_raw_input_event())
+                .collect(),
+            false,
+        );
+        app.shutdown_terminal_runtime(terminal_id.clone());
+
+        assert_eq!(
+            rx.try_recv().expect("grouped press"),
+            bytes::Bytes::from_static(b"\x1b[97;1:1u\x1b[97;1:2u\x1b[97;1:2u")
+        );
+        assert_eq!(
+            rx.try_recv()
+                .expect("synthetic release before runtime shutdown"),
+            bytes::Bytes::from_static(b"\x1b[97;1:3u")
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn report_all_repeat_and_release_return_to_the_pressed_pane() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let pressed_pane = workspace.focused_pane_id().unwrap();
+        let other_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(pressed_pane);
+        let (pressed_runtime, mut pressed_rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 4);
+        let (other_runtime, mut other_rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 4);
+        workspace.tabs[0]
+            .runtimes
+            .insert(pressed_pane, pressed_runtime);
+        workspace.tabs[0].runtimes.insert(other_pane, other_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"\x1b[106u".to_vec());
+        assert!(app.state.focus_pane_in_workspace(0, other_pane));
+        app.route_client_input(b"\x1b[106;1:2u\x1b[106;1:3u".to_vec());
+
+        assert_eq!(
+            pressed_rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert_eq!(
+            pressed_rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:2u")
+        );
+        assert_eq!(
+            pressed_rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(pressed_rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn report_all_key_ownership_is_isolated_by_client() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let first_pane = workspace.focused_pane_id().unwrap();
+        let second_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(first_pane);
+        let (first_runtime, mut first_rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 3);
+        let (second_runtime, mut second_rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 3);
+        workspace.tabs[0].runtimes.insert(first_pane, first_runtime);
+        workspace.tabs[0]
+            .runtimes
+            .insert(second_pane, second_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_events_from(
+            1,
+            vec![raw_key(
+                KeyCode::Char('j'),
+                KeyModifiers::empty(),
+                KeyEventKind::Press,
+            )],
+            false,
+        );
+        assert!(app.state.focus_pane_in_workspace(0, second_pane));
+        app.route_client_events_from(
+            2,
+            vec![raw_key(
+                KeyCode::Char('j'),
+                KeyModifiers::empty(),
+                KeyEventKind::Press,
+            )],
+            false,
+        );
+        app.route_client_events_from(
+            1,
+            vec![raw_key(
+                KeyCode::Char('j'),
+                KeyModifiers::empty(),
+                KeyEventKind::Release,
+            )],
+            false,
+        );
+        app.route_client_events_from(
+            2,
+            vec![raw_key(
+                KeyCode::Char('j'),
+                KeyModifiers::empty(),
+                KeyEventKind::Release,
+            )],
+            false,
+        );
+
+        for rx in [&mut first_rx, &mut second_rx] {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                bytes::Bytes::from_static(b"\x1b[106;1:1u")
+            );
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                bytes::Bytes::from_static(b"\x1b[106;1:3u")
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn report_all_release_survives_modifier_release_order() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 3);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"\x1b[106:74;2u\x1b[106;1:3u".to_vec());
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106:74;2:1u")
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_client_input_does_not_forward_release_for_consumed_prefix() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 2);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        app.route_client_input(b"\x1b[98;5u\x1b[98;5:3u".to_vec());
+
+        assert_eq!(app.state.mode, Mode::Prefix);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_client_input_preserves_shift_enter_for_modify_other_keys_pane() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) = TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[>4;1m");
         workspace.tabs[0].runtimes.insert(focused, runtime);
         app.state.workspaces = vec![workspace];
         app.state.active = Some(0);
@@ -4477,6 +5959,207 @@ last_pane = "prefix+tab"
         );
     }
 
+    #[tokio::test]
+    async fn route_client_events_pastes_only_into_popup() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("tiled");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (tiled_runtime, mut tiled_rx) = TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(focused, tiled_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let (popup_runtime, mut popup_rx) = TerminalRuntime::test_with_channel(40, 12);
+        app.install_test_popup_runtime(popup_runtime);
+        assert!(app
+            .state
+            .should_capture_host_mouse_from(&app.terminal_runtimes));
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste("popup-only".into())],
+            true,
+        );
+
+        assert_eq!(
+            popup_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"popup-only")
+        );
+        assert!(tiled_rx.try_recv().is_err());
+
+        app.route_client_events(
+            vec![raw_key(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )],
+            true,
+        );
+        assert_eq!(
+            popup_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"x")
+        );
+        assert!(tiled_rx.try_recv().is_err());
+
+        app.state.mode = Mode::Settings;
+        assert!(
+            app.handle_raw_input_event(raw_key(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ))
+            .await
+        );
+        assert_eq!(
+            popup_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"y")
+        );
+        assert!(tiled_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_client_events_discards_paste_when_popup_runtime_is_missing() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("tiled");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (tiled_runtime, mut tiled_rx) = TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(focused, tiled_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        let install_missing_popup = |app: &mut App| {
+            let popup_terminal_id = crate::terminal::TerminalId::alloc();
+            app.state.terminals.insert(
+                popup_terminal_id.clone(),
+                crate::terminal::TerminalState::new(
+                    popup_terminal_id.clone(),
+                    std::path::PathBuf::from("/popup"),
+                ),
+            );
+            app.state.popup_pane = Some(state::PopupPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: popup_terminal_id,
+                width: None,
+                height: None,
+            });
+        };
+        install_missing_popup(&mut app);
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste("discard-me".into())],
+            true,
+        );
+
+        assert!(tiled_rx.try_recv().is_err());
+        assert!(app.state.popup_pane.is_none());
+
+        install_missing_popup(&mut app);
+        assert!(
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Paste(
+                "discard-monolithic".into(),
+            ))
+            .await
+        );
+        assert!(tiled_rx.try_recv().is_err());
+        assert!(app.state.popup_pane.is_none());
+    }
+
+    #[tokio::test]
+    async fn popup_mouse_motion_preserves_scrollback() {
+        let mut app = test_app();
+        app.state.mode = Mode::Terminal;
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let (popup_runtime, mut popup_rx) = TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            40,
+            2,
+            1024,
+            b"one\r\ntwo\r\nthree\r\n\x1b[?1003h\x1b[?1006h",
+            4,
+        );
+        popup_runtime.scroll_up(1);
+        assert!(popup_runtime
+            .scroll_metrics()
+            .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+        app.install_test_popup_runtime(popup_runtime);
+        let (_, inner) =
+            crate::ui::popup_pane_rects(&app.state, app.state.view.terminal_area).unwrap();
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Moved,
+                    column: inner.x + 1,
+                    row: inner.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            )],
+            true,
+        );
+
+        assert!(popup_rx.try_recv().is_ok());
+        assert!(app
+            .popup_runtime()
+            .and_then(TerminalRuntime::scroll_metrics)
+            .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+    }
+
+    #[tokio::test]
+    async fn route_client_events_routes_popup_mouse_when_global_capture_is_disabled() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("tiled");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (tiled_runtime, mut tiled_rx) = TerminalRuntime::test_with_channel(80, 24);
+        tiled_runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        workspace.tabs[0].runtimes.insert(focused, tiled_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.mouse_capture = false;
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+
+        let (popup_runtime, mut popup_rx) = TerminalRuntime::test_with_channel(40, 12);
+        popup_runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        app.install_test_popup_runtime(popup_runtime);
+        let (_, inner) =
+            crate::ui::popup_pane_rects(&app.state, app.state.view.terminal_area).unwrap();
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: inner.x,
+                    row: inner.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            )],
+            true,
+        );
+
+        assert!(popup_rx.try_recv().is_ok());
+        assert!(tiled_rx.try_recv().is_err());
+
+        assert!(
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: inner.x + 1,
+                    row: inner.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            ))
+            .await
+        );
+        assert!(popup_rx.try_recv().is_ok());
+        assert!(tiled_rx.try_recv().is_err());
+    }
+
     #[test]
     fn route_client_input_closes_release_notes_modal() {
         let mut app = test_app();
@@ -4511,7 +6194,7 @@ last_pane = "prefix+tab"
     fn route_client_input_updates_host_terminal_theme_from_osc_response() {
         let mut app = test_app();
 
-        app.route_client_input(b"\x1b]11;#123456\x07".to_vec());
+        app.route_client_input(b"\x1b]11;#123456\x07\x1b]4;7;rgb:aaaa/bbbb/cccc\x1b\\".to_vec());
 
         assert_eq!(
             app.state.host_terminal_theme.background,
@@ -4519,6 +6202,34 @@ last_pane = "prefix+tab"
                 r: 0x12,
                 g: 0x34,
                 b: 0x56,
+            })
+        );
+        assert_eq!(
+            app.state.host_terminal_theme.palette[7],
+            Some(crate::terminal_theme::RgbColor {
+                r: 0xaa,
+                g: 0xbb,
+                b: 0xcc,
+            })
+        );
+
+        app.route_client_input(crate::raw_input::GHOSTTY_COLOR_SCHEME_DARK_REPORT.to_vec());
+        assert_eq!(
+            app.state.host_terminal_theme.palette[7],
+            Some(crate::terminal_theme::RgbColor {
+                r: 0xaa,
+                g: 0xbb,
+                b: 0xcc,
+            })
+        );
+
+        app.route_client_input(b"\x1b]4;7;rgb:dddd/eeee/ffff\x1b\\".to_vec());
+        assert_eq!(
+            app.state.host_terminal_theme.palette[7],
+            Some(crate::terminal_theme::RgbColor {
+                r: 0xdd,
+                g: 0xee,
+                b: 0xff,
             })
         );
     }

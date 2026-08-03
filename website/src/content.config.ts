@@ -2,12 +2,7 @@ import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
 import { docsLoader } from '@astrojs/starlight/loaders';
 import { docsSchema } from '@astrojs/starlight/schema';
-
-function docsPath({ entry }: { entry: string }) {
-  const slug = entry.replace(/\.(md|mdx|markdown|mdown|mkdn|mkd|mdwn)$/i, '');
-  const normalized = slug.replace(/\/index$/, '');
-  return normalized === 'index' ? 'docs' : `docs/${normalized}`;
-}
+import { docsPath } from './docs-path';
 
 export const collections = {
   docs: defineCollection({ loader: docsLoader({ generateId: docsPath }), schema: docsSchema() }),
@@ -18,6 +13,9 @@ export const collections = {
       description: z.string(),
       date: z.coerce.date(),
       draft: z.boolean().default(false),
+      /* description is always used for meta and OG; set false when it should
+         not also print as a subtitle under the title */
+      lede: z.boolean().default(true),
       ogImage: z.string().optional(),
     }),
   }),

@@ -1,8 +1,8 @@
 use crate::api::schema::{
-    Method, Request, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
-    WorktreeRemoveParams,
+    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
 };
 
+// Worktree output is always JSON. The parsers retain `--json` as a hidden compatibility no-op.
 pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
         print_worktree_help();
@@ -56,14 +56,11 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
         }
     }
     if workspace_id.is_some() && cwd.is_some() {
-        eprintln!("usage: herdr worktree list [--workspace ID | --cwd PATH] [--json]");
+        eprintln!("usage: herdr worktree list [--workspace ID | --cwd PATH]");
         return Ok(2);
     }
 
-    super::print_response(&super::send_request(&Request {
-        id: "cli:worktree:list".into(),
-        method: Method::WorktreeList(WorktreeListParams { workspace_id, cwd }),
-    })?)
+    super::runtime::worktree_list(WorktreeListParams { workspace_id, cwd })
 }
 
 fn worktree_create(args: &[String]) -> std::io::Result<i32> {
@@ -143,23 +140,20 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus]"
         );
         return Ok(2);
     }
 
-    super::print_response(&super::send_request(&Request {
-        id: "cli:worktree:create".into(),
-        method: Method::WorktreeCreate(WorktreeCreateParams {
-            workspace_id,
-            cwd,
-            branch,
-            base,
-            path,
-            label,
-            focus,
-        }),
-    })?)
+    super::runtime::worktree_create(WorktreeCreateParams {
+        workspace_id,
+        cwd,
+        branch,
+        base,
+        path,
+        label,
+        focus,
+    })
 }
 
 fn worktree_open(args: &[String]) -> std::io::Result<i32> {
@@ -230,28 +224,25 @@ fn worktree_open(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus]"
         );
         return Ok(2);
     }
     if path.is_some() == branch.is_some() {
         eprintln!(
-            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus]"
         );
         return Ok(2);
     }
 
-    super::print_response(&super::send_request(&Request {
-        id: "cli:worktree:open".into(),
-        method: Method::WorktreeOpen(WorktreeOpenParams {
-            workspace_id,
-            cwd,
-            path,
-            branch,
-            label,
-            focus,
-        }),
-    })?)
+    super::runtime::worktree_open(WorktreeOpenParams {
+        workspace_id,
+        cwd,
+        path,
+        branch,
+        label,
+        focus,
+    })
 }
 
 fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
@@ -282,29 +273,26 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
     }
 
     let Some(workspace_id) = workspace_id else {
-        eprintln!("usage: herdr worktree remove --workspace ID [--force] [--json]");
+        eprintln!("usage: herdr worktree remove --workspace ID [--force]");
         return Ok(2);
     };
 
-    super::print_response(&super::send_request(&Request {
-        id: "cli:worktree:remove".into(),
-        method: Method::WorktreeRemove(WorktreeRemoveParams {
-            workspace_id,
-            force,
-        }),
-    })?)
+    super::runtime::worktree_remove(WorktreeRemoveParams {
+        workspace_id,
+        force,
+    })
 }
 
 fn print_worktree_help() {
     eprintln!("herdr worktree commands:");
-    eprintln!("  herdr worktree list [--workspace ID | --cwd PATH] [--json]");
+    eprintln!("  herdr worktree list [--workspace ID | --cwd PATH]");
     eprintln!(
-        "  herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus]"
     );
     eprintln!(
-        "  herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus]"
     );
-    eprintln!("  herdr worktree remove --workspace ID [--force] [--json]");
+    eprintln!("  herdr worktree remove --workspace ID [--force]");
 }
 
 fn normalize_path_arg(value: &str) -> std::io::Result<String> {

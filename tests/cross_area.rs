@@ -548,6 +548,15 @@ fn decode_frame_payload(payload: &[u8]) -> io::Result<FrameWire> {
         })
 }
 
+fn frame_contains_colored_symbol(frame: &FrameWire, symbol: &str, rgb: (u8, u8, u8)) -> bool {
+    let (r, g, b) = rgb;
+    let fg = 0x02_00_00_00 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+    frame
+        .cells
+        .iter()
+        .any(|cell| cell.symbol == symbol && cell.fg == fg)
+}
+
 fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
     if frame.cells.is_empty() {
         return false;
@@ -836,7 +845,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     client_handshake(&mut client_b, CURRENT_PROTOCOL, 80, 24);
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_text(frame, "working")
+            frame_contains_colored_symbol(frame, "●", (249, 226, 175))
         })
         .expect("frame decoding should succeed");
     assert!(
@@ -844,21 +853,23 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
         "reattached client frame should expose persisted agent working status"
     );
 
-    // Transition to idle and verify API + client surfaces both observe it.
-    pane_report_agent(&api_socket, &pane_id, "pi", "idle", "cross-area-test");
+    // Transition to blocked and verify API + client surfaces both observe it.
+    // The fake process remains visibly working, so blocked is the deterministic
+    // higher-priority semantic transition for this cross-area projection test.
+    pane_report_agent(&api_socket, &pane_id, "pi", "blocked", "cross-area-test");
     assert!(
-        wait_for_agent_status(&api_socket, &pane_id, "idle", Duration::from_secs(3)),
-        "pane agent status should transition to idle"
+        wait_for_agent_status(&api_socket, &pane_id, "blocked", Duration::from_secs(3)),
+        "pane agent status should transition to blocked"
     );
 
-    let saw_idle_on_client =
+    let saw_blocked_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_text(frame, "idle")
+            frame_contains_colored_symbol(frame, "●", (243, 139, 168))
         })
         .expect("frame decoding should succeed");
     assert!(
-        saw_idle_on_client,
-        "reattached client frame should show idle status after transition"
+        saw_blocked_on_client,
+        "reattached client frame should show blocked status after transition"
     );
 
     cleanup_spawned_herdr(server, base);

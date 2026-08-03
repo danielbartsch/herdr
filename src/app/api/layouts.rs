@@ -93,6 +93,7 @@ impl App {
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let extra_env = match super::env::normalize_launch_env(root_leaf.env.clone()) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
@@ -115,6 +116,7 @@ impl App {
                     extra_env,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                 )
             } else {
                 ws.create_tab(
@@ -123,6 +125,7 @@ impl App {
                     first_cwd,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                     crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
                     extra_env,
                 )
@@ -207,6 +210,7 @@ impl App {
                 });
             }
         }
+        self.emit_layout_updated_event(ws_idx, new_tab_idx);
 
         let Some(layout) = self.layout_description(ws_idx, new_tab_idx) else {
             return encode_error(id, "layout_apply_failed", "new layout unavailable");
@@ -243,6 +247,7 @@ impl App {
         let Some(layout) = self.layout_description(ws_idx, tab_idx) else {
             return encode_error(id, "layout_not_found", "layout unavailable");
         };
+        self.emit_layout_updated_event(ws_idx, tab_idx);
         encode_success(id, ResponseResult::LayoutSplitRatioSet { layout })
     }
 
@@ -337,13 +342,15 @@ impl App {
             return PathBuf::from(cwd);
         }
         let follow_cwd = replace_target.and_then(|(_, tab_idx)| {
-            let ws = self.state.workspaces.get(ws_idx)?;
-            let tab = ws.tabs.get(tab_idx)?;
-            tab.cwd_for_pane(
-                tab.layout.focused(),
-                &self.state.terminals,
-                &self.terminal_runtimes,
-            )
+            let pane_id = self
+                .state
+                .workspaces
+                .get(ws_idx)?
+                .tabs
+                .get(tab_idx)?
+                .layout
+                .focused();
+            self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
         });
         self.resolve_new_terminal_cwd(
             follow_cwd.or_else(|| self.focused_pane_cwd_in_workspace(ws_idx)),
@@ -393,11 +400,12 @@ impl App {
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let cwd = pane
             .cwd
             .as_ref()
             .map(PathBuf::from)
-            .or_else(|| self.cwd_for_pane_in_workspace(ws_idx, target_pane_id));
+            .or_else(|| self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id));
         let extra_env = super::env::normalize_launch_env(pane.env.clone())
             .map_err(|(_, message)| message.to_string())?;
         let direction = match direction {
@@ -421,6 +429,7 @@ impl App {
                     extra_env,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                     false,
                 )
             } else {
@@ -433,6 +442,7 @@ impl App {
                     cwd,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                     crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
                     extra_env,
                     false,
@@ -687,6 +697,12 @@ mod tests {
             panic!("expected split layout root");
         };
         assert!((ratio - 0.72).abs() < f32::EPSILON);
+        assert!(matches!(
+            &app.event_hub.events_after(0).last().expect("layout event").1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 0).unwrap()
+                    && (layout.splits[0].ratio - 0.72).abs() < f32::EPSILON
+        ));
     }
 
     #[test]
@@ -775,6 +791,12 @@ mod tests {
             second_pane.command,
             Some(vec!["sh".into(), "-c".into(), "true".into()])
         );
+        assert!(matches!(
+            &app.event_hub.events_after(0).last().expect("layout event").1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 0).unwrap()
+                    && layout.panes.len() == 2
+        ));
         shutdown_test_runtimes(&mut app);
     }
 
