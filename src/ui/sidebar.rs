@@ -10,7 +10,9 @@ use ratatui::{
 
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
-use super::status::{state_icon, state_label, state_label_color};
+use super::status::{
+    state_icon, state_label, state_label_color, status_legend_entries, STATUS_LEGEND_LABELS,
+};
 use super::text::{display_width, display_width_u16, truncate_end};
 use super::HoverTooltip;
 use crate::app::state::{AgentPanelSort, Palette};
@@ -20,6 +22,11 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
+
+/// Blank spacer row between the agent list and the status-icon legend.
+const AGENT_LEGEND_SPACER_ROWS: u16 = 1;
+/// Two spaces separate legend chips packed onto the same line.
+const AGENT_LEGEND_CHIP_GAP: u16 = 2;
 
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
@@ -532,13 +539,107 @@ pub(crate) fn workspace_list_scrollbar_rect(app: &AppState, area: Rect) -> Optio
     ))
 }
 
+/// Columns one legend chip needs: glyph (1) + space (1) + label.
+fn agent_legend_chip_width(label: &str) -> u16 {
+    2u16.saturating_add(label.chars().count() as u16)
+}
+
+/// Greedily packs the legend labels into lines that each fit `width`, returning
+/// the label index for every chip grouped by line. Used only by the renderer;
+/// geometry uses [`agent_legend_line_count`], which must stay in step.
+fn agent_legend_lines(width: u16) -> Vec<Vec<usize>> {
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    if width == 0 {
+        return lines;
+    }
+
+    let mut current: Vec<usize> = Vec::new();
+    let mut used = 0u16;
+    for (idx, label) in STATUS_LEGEND_LABELS.iter().enumerate() {
+        let chip = agent_legend_chip_width(label);
+        let with_gap = AGENT_LEGEND_CHIP_GAP.saturating_add(chip);
+        if !current.is_empty() && used.saturating_add(with_gap) > width {
+            lines.push(std::mem::take(&mut current));
+            current.push(idx);
+            used = chip;
+        } else if current.is_empty() {
+            current.push(idx);
+            used = chip;
+        } else {
+            current.push(idx);
+            used = used.saturating_add(with_gap);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Number of legend lines at `width`, without allocating. Mirrors the packing in
+/// [`agent_legend_lines`]; the two are kept equivalent by test.
+fn agent_legend_line_count(width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+
+    let mut lines = 0u16;
+    let mut used = 0u16;
+    let mut line_started = false;
+    for label in STATUS_LEGEND_LABELS {
+        let chip = agent_legend_chip_width(label);
+        let with_gap = AGENT_LEGEND_CHIP_GAP.saturating_add(chip);
+        if !line_started {
+            lines += 1;
+            used = chip;
+            line_started = true;
+        } else if used.saturating_add(with_gap) > width {
+            lines += 1;
+            used = chip;
+        } else {
+            used = used.saturating_add(with_gap);
+        }
+    }
+    lines
+}
+
+/// Rows the legend reserves at the bottom of the agent pane, including the blank
+/// spacer above it. Returns `0` when the pane is too short to keep at least one
+/// list row after reserving, so small panes render exactly as before.
+fn agent_legend_reserved_rows(area: Rect) -> u16 {
+    let content_rows = agent_legend_line_count(area.width);
+    if content_rows == 0 {
+        return 0;
+    }
+    let reserved = content_rows.saturating_add(AGENT_LEGEND_SPACER_ROWS);
+    let list_capacity = area.height.saturating_sub(AGENT_PANEL_HEADER_ROWS);
+    if list_capacity > reserved {
+        reserved
+    } else {
+        0
+    }
+}
+
+/// Rect the legend chips render into (the spacer row is excluded), or the empty
+/// rect when no legend is shown.
+fn agent_legend_rect(area: Rect) -> Rect {
+    let reserved = agent_legend_reserved_rows(area);
+    if reserved == 0 {
+        return Rect::default();
+    }
+    let content_rows = reserved.saturating_sub(AGENT_LEGEND_SPACER_ROWS);
+    let y = (area.y + area.height).saturating_sub(content_rows);
+    Rect::new(area.x, y, area.width, content_rows)
+}
+
 pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
     if area.width == 0 || area.height <= AGENT_PANEL_HEADER_ROWS {
         return Rect::default();
     }
 
     let body_y = area.y.saturating_add(AGENT_PANEL_HEADER_ROWS);
-    let body_height = (area.y + area.height).saturating_sub(body_y);
+    let body_bottom = (area.y + area.height).saturating_sub(agent_legend_reserved_rows(area));
+    let body_height = body_bottom.saturating_sub(body_y);
     let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
     Rect::new(area.x, body_y, body_width, body_height)
 }
@@ -1542,6 +1643,7 @@ fn render_agent_detail(
     if body == Rect::default() {
         return;
     }
+    render_agent_legend(app, frame, area);
     if details.is_empty() && app.agent_view_override.is_some() {
         frame.render_widget(
             Paragraph::new(" no matching agents")
@@ -1649,6 +1751,45 @@ fn render_agent_detail(
     }
 }
 
+/// Draws the status-icon legend across the reserved rows at the bottom of the
+/// agent pane. Each chip pairs the active-style glyph (in its state color) with
+/// a short label, so the color that distinguishes otherwise-identical dots is
+/// explained in place.
+fn render_agent_legend(app: &AppState, frame: &mut Frame, area: Rect) {
+    let legend_rect = agent_legend_rect(area);
+    if legend_rect == Rect::default() {
+        return;
+    }
+
+    let p = &app.palette;
+    let entries = status_legend_entries(app.status_indicators, p);
+    let label_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
+    for (row, chips) in agent_legend_lines(area.width).iter().enumerate() {
+        if row as u16 >= legend_rect.height {
+            break;
+        }
+        let mut spans: Vec<Span> = Vec::new();
+        for (position, &entry_idx) in chips.iter().enumerate() {
+            if position > 0 {
+                spans.push(Span::raw("  "));
+            }
+            let (symbol, label, color) = entries[entry_idx];
+            spans.push(Span::styled(symbol, Style::default().fg(color)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(label, label_style));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(
+                legend_rect.x,
+                legend_rect.y + row as u16,
+                legend_rect.width,
+                1,
+            ),
+        );
+    }
+}
+
 pub(crate) fn collapsed_sidebar_toggle_rect(area: Rect) -> Rect {
     let bottom_y = area.y + area.height.saturating_sub(1);
     let content_w = area.width.saturating_sub(1);
@@ -1721,6 +1862,100 @@ mod tests {
     }
 
     #[test]
+    fn agent_legend_line_count_matches_packed_lines() {
+        for width in 0u16..80 {
+            assert_eq!(
+                agent_legend_line_count(width) as usize,
+                agent_legend_lines(width).len(),
+                "line count diverged from packing at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_legend_reserves_bottom_rows_only_when_the_list_survives() {
+        // Tall pane: the legend packs into two lines at this width, plus a spacer.
+        let tall = Rect::new(0, 0, 26, 20);
+        assert_eq!(agent_legend_line_count(tall.width), 2);
+        assert_eq!(agent_legend_reserved_rows(tall), 3);
+        let body = agent_panel_body_rect(tall, false);
+        // The list body ends exactly where the reserved legend strip begins.
+        assert_eq!(body.y + body.height, tall.y + tall.height - 3);
+
+        // Short pane: reserving would leave no list rows, so no legend is shown
+        // and the body matches the pre-legend geometry.
+        let short = Rect::new(0, 0, 26, 6);
+        assert_eq!(agent_legend_reserved_rows(short), 0);
+        let short_body = agent_panel_body_rect(short, false);
+        assert_eq!(short_body.y, short.y + AGENT_PANEL_HEADER_ROWS);
+        assert_eq!(short_body.y + short_body.height, short.y + short.height);
+    }
+
+    #[test]
+    fn agent_legend_draws_colored_glyphs_at_the_pane_bottom() {
+        let mut app = crate::app::state::AppState::test_new();
+        let workspace = Workspace::test_new("one");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal_state.detected_agent = Some(Agent::Pi);
+        terminal_state.state = AgentState::Working;
+
+        let area = Rect::new(0, 0, 26, 20);
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_sidebar(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                    &mut Vec::new(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let legend_rect = agent_legend_rect(agent_area);
+        assert_eq!(legend_rect.height, 2);
+
+        // First line: working then blocked, both filled dots in the default style;
+        // only the color separates them, so the glyph carries its state color.
+        let first = row_text(buffer, legend_rect.y, legend_rect.width);
+        assert!(
+            first.starts_with("● working"),
+            "unexpected legend line: {first:?}"
+        );
+        assert!(first.contains("blocked"));
+        let working_glyph = &buffer[(legend_rect.x, legend_rect.y)];
+        assert_eq!(working_glyph.symbol(), "●");
+        assert_eq!(working_glyph.style().fg, Some(app.palette.yellow));
+
+        // Second line: done / idle / none, with idle drawn as an open circle and
+        // none as the faint dot for panes with no detected agent.
+        let second = row_text(buffer, legend_rect.y + 1, legend_rect.width);
+        assert!(second.contains("done"));
+        assert!(second.contains("idle"));
+        assert!(second.contains("none"));
+        let idle_x = find_symbol_x(buffer, legend_rect.y + 1, legend_rect.width, "○");
+        assert_eq!(
+            buffer[(idle_x, legend_rect.y + 1)].style().fg,
+            Some(app.palette.green)
+        );
+        let none_x = find_symbol_x(buffer, legend_rect.y + 1, legend_rect.width, "·");
+        assert_eq!(
+            buffer[(none_x, legend_rect.y + 1)].style().fg,
+            Some(app.palette.overlay0)
+        );
+    }
+
+    #[test]
     fn expanded_and_collapsed_sidebars_use_custom_background() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces.clear();
@@ -1731,7 +1966,13 @@ mod tests {
         let mut expanded = Terminal::new(TestBackend::new(26, 20)).unwrap();
         expanded
             .draw(|frame| {
-                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &mut Vec::new())
+                render_sidebar(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                    &mut Vec::new(),
+                )
             })
             .unwrap();
         assert!(expanded
@@ -1905,7 +2146,13 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
         let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
         terminal
             .draw(|frame| {
-                render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area, &mut Vec::new())
+                render_sidebar(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                    &mut Vec::new(),
+                )
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

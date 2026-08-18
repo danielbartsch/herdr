@@ -244,6 +244,43 @@ pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> C
     }
 }
 
+/// The (state, seen) combinations shown in the agents-pane legend, in display
+/// order. One row per meaningfully distinct glyph/color.
+const LEGEND_STATES: [(AgentState, bool); 5] = [
+    (AgentState::Working, true),
+    (AgentState::Blocked, true),
+    (AgentState::Idle, false),
+    (AgentState::Idle, true),
+    (AgentState::Unknown, true),
+];
+
+/// Short human labels for the legend, aligned by index with [`LEGEND_STATES`].
+/// `state_label` collapses `Unknown` into "idle", so the legend spells the
+/// labels out separately to keep every glyph distinct ("none" = no detected
+/// agent / plain shell).
+pub(super) const STATUS_LEGEND_LABELS: [&str; 5] = ["working", "blocked", "done", "idle", "none"];
+
+/// Resolves each legend row to `(symbol, label, color)` for the active indicator
+/// style. Single source of truth for what the agents-pane legend renders.
+pub(super) fn status_legend_entries(
+    indicator_style: StatusIndicatorStyle,
+    p: &Palette,
+) -> [(&'static str, &'static str, Color); 5] {
+    let mut entries = [("", "", p.overlay0); 5];
+    for (slot, ((state, seen), label)) in LEGEND_STATES
+        .into_iter()
+        .zip(STATUS_LEGEND_LABELS)
+        .enumerate()
+    {
+        entries[slot] = (
+            state_icon_symbol(state, seen, indicator_style),
+            label,
+            state_label_color(state, seen, p),
+        );
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
