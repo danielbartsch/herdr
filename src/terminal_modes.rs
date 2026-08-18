@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 
+#[cfg(not(windows))]
+use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 #[cfg(any(not(windows), test))]
 const DISABLE_HOST_MOUSE_REPORTING_SEQUENCE: &[u8] =
     b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -24,8 +26,13 @@ pub(crate) fn set_host_kitty_keyboard_report_all<W: Write>(
     if report_all_keys {
         flags |= crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
     }
-    write!(writer, "\x1b[={}u", flags.bits())?;
-    writer.flush()
+    // Older iTerm2 releases clear the keyboard stack on SET, so a later pop
+    // cannot restore the host state. Replace only Herdr's top entry instead.
+    crossterm::execute!(
+        writer,
+        PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags(flags)
+    )
 }
 
 #[cfg(windows)]
@@ -41,18 +48,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_keyboard_report_all_only_changes_the_current_herdr_stack_entry() {
+    fn host_keyboard_report_all_replaces_the_current_herdr_stack_entry() {
         let mut output = Vec::new();
 
         set_host_kitty_keyboard_report_all(&mut output, true).unwrap();
         set_host_kitty_keyboard_report_all(&mut output, false).unwrap();
 
-        // `\x1b[=<flags>u` sets the current stack entry instead of pushing a new
-        // one. Flags are the IME-compatible set (5 = DISAMBIGUATE_ESCAPE_CODES |
-        // REPORT_ALTERNATE_KEYS; REPORT_EVENT_TYPES is deliberately excluded, see
-        // `ime_compatible_keyboard_enhancement_flags`), plus REPORT_ALL_KEYS (8)
-        // while report-all is on.
-        assert_eq!(output, b"\x1b[=13u\x1b[=5u");
+        // Pop replaces Herdr's top stack entry (`\x1b[<1u`) and Push sets the new
+        // flags (`\x1b[>{flags}u`). Flags are the IME-compatible set (5 =
+        // DISAMBIGUATE_ESCAPE_CODES | REPORT_ALTERNATE_KEYS; REPORT_EVENT_TYPES is
+        // deliberately excluded, see `ime_compatible_keyboard_enhancement_flags`),
+        // plus REPORT_ALL_KEYS (8) while report-all is on.
+        assert_eq!(output, b"\x1b[<1u\x1b[>13u\x1b[<1u\x1b[>5u");
     }
 
     #[test]

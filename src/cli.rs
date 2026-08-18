@@ -29,6 +29,15 @@ const TERMINAL_SESSION_OBSERVE_USAGE: &str =
     "usage: herdr terminal session observe <target> [--cols N] [--rows N]";
 const TERMINAL_SESSION_CONTROL_USAGE: &str =
     "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N]";
+pub(crate) const AGENT_HELP_FOOTER: &str = concat!(
+    "Are you an AI? Use these resources ONLY IF your task specifically asks you to:\n",
+    "  Help a human understand or set up Herdr for the first time:\n",
+    "    https://herdr.dev/agent-guide.md\n",
+    "  Debug or investigate a problem with Herdr:\n",
+    "    https://herdr.dev/llms.txt\n",
+    "  Control Herdr panes, agents, or workspaces:\n",
+    "    SKIP if a Herdr skill is already in your context. Otherwise run: herdr --skill",
+);
 
 pub(crate) fn parse_token_assignment(raw: &str) -> Result<(String, Option<String>), String> {
     let Some((key, value)) = raw.split_once('=') else {
@@ -913,6 +922,25 @@ pub(super) fn parse_u64_flag(flag: &str, value: &str) -> std::io::Result<u64> {
         .map_err(|_| std::io::Error::other(format!("invalid value for {flag}: {value}")))
 }
 
+/// Expand `--flag=value` tokens into separate `--flag` and `value` tokens so
+/// the hand-rolled subcommand parsers accept the same `--flag=value` form the
+/// clap-generated help and completions imply. Only `value_options` are split:
+/// boolean and unknown options keep their attached value so they still reach
+/// the parser's unknown-option branch.
+pub(super) fn expand_equals_args(args: &[String], value_options: &[&str]) -> Vec<String> {
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.split_once('=') {
+            Some((flag, value)) if value_options.contains(&flag) => {
+                expanded.push(flag.to_string());
+                expanded.push(value.to_string());
+            }
+            _ => expanded.push(arg.clone()),
+        }
+    }
+    expanded
+}
+
 fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
     match args {
         [] => Ok(false),
@@ -1120,5 +1148,30 @@ mod tests {
             &client,
         );
         assert!(!super::server_not_running::was_reported(&mapped));
+    }
+
+    #[test]
+    fn expand_equals_args_splits_value_options_only() {
+        // Known value options split; values may contain `=`. Boolean and
+        // unknown options keep the attached form so parsers still reject them.
+        let args = vec![
+            "--match=a=b".to_string(),
+            "name=value".to_string(),
+            "--raw=value".to_string(),
+            "--bogus=value".to_string(),
+            "--timeout=5000".to_string(),
+        ];
+        assert_eq!(
+            super::expand_equals_args(&args, &["--match", "--timeout"]),
+            vec![
+                "--match",
+                "a=b",
+                "name=value",
+                "--raw=value",
+                "--bogus=value",
+                "--timeout",
+                "5000",
+            ]
+        );
     }
 }
