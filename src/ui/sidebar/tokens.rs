@@ -165,6 +165,8 @@ mod tests {
             primary_label: "repo".into(),
             primary_tab_label: None,
             pane_label: None,
+            manual_label: None,
+            agent_name: None,
             terminal_title: None,
             terminal_title_stripped: None,
             agent_label: Some("pi".into()),

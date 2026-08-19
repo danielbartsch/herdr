@@ -22,8 +22,7 @@ impl AppState {
     /// clicked entry's tooltip painted indefinitely.
     pub(crate) fn sidebar_hover_target(&self) -> Option<SidebarHoverTarget> {
         let (col, row) = self.last_mouse_pos?;
-        if self.sidebar_collapsed
-            || self.view.layout != ViewLayout::Desktop
+        if self.view.layout != ViewLayout::Desktop
             || !crate::ui::sidebar_hover_tooltip_allowed(self.mode)
         {
             return None;
@@ -36,6 +35,18 @@ impl AppState {
             || row >= sidebar.y + sidebar.height
         {
             return None;
+        }
+        // Collapsed sidebar rows show only a status icon, so hovering one reveals
+        // its name in a tooltip; identify the row so the motion forces a repaint.
+        if self.sidebar_collapsed {
+            if let Some(ws_idx) = self.collapsed_workspace_at_row(row) {
+                return Some(SidebarHoverTarget::Space(ws_idx));
+            }
+            return self
+                .collapsed_agent_detail_target_at(row)
+                .map(|(ws_idx, tab_idx, pane_id)| {
+                    SidebarHoverTarget::Agent(ws_idx, tab_idx, pane_id)
+                });
         }
         let hovered_card = self.view.workspace_card_areas.iter().find(|card| {
             col >= card.rect.x
@@ -922,13 +933,19 @@ mod tests {
         app.state.last_mouse_pos = Some((app.state.view.terminal_area.x + 2, card.y));
         assert_eq!(app.state.sidebar_hover_target(), None);
 
-        // A collapsed sidebar draws no tooltip, so it has no hover target.
-        app.state.last_mouse_pos = Some((card.x + 1, card.y));
+        // A collapsed sidebar now reveals the hovered item's name in a tooltip,
+        // so hovering a collapsed workspace row is a hover target too.
         app.state.sidebar_collapsed = true;
-        assert_eq!(app.state.sidebar_hover_target(), None);
+        let (ws_area, _, _) = crate::ui::collapsed_sidebar_sections(app.state.view.sidebar_rect);
+        app.state.last_mouse_pos = Some((ws_area.x, ws_area.y));
+        assert_eq!(
+            app.state.sidebar_hover_target(),
+            Some(SidebarHoverTarget::Space(0))
+        );
         app.state.sidebar_collapsed = false;
 
-        // Neither do modes that cover the sidebar with a modal.
+        // Modes that cover the sidebar with a modal still have no hover target.
+        app.state.last_mouse_pos = Some((card.x + 1, card.y));
         app.state.mode = Mode::Settings;
         assert_eq!(app.state.sidebar_hover_target(), None);
     }

@@ -1216,6 +1216,8 @@ mod tests {
             primary_label: "herdr".into(),
             primary_tab_label: primary_tab_label.map(str::to_string),
             pane_label: None,
+            manual_label: None,
+            agent_name: None,
             terminal_title: None,
             terminal_title_stripped: None,
             agent_label: agent_label.map(str::to_string),

@@ -35,6 +35,10 @@ pub(crate) struct AgentPanelEntry {
     pub primary_label: String,
     pub primary_tab_label: Option<String>,
     pub pane_label: Option<String>,
+    /// Manually assigned pane name, if any (the user-typed name).
+    pub manual_label: Option<String>,
+    /// Agent self-generated name, if any.
+    pub agent_name: Option<String>,
     pub terminal_title: Option<String>,
     pub terminal_title_stripped: Option<String>,
     pub agent_label: Option<String>,
@@ -175,6 +179,8 @@ fn collect_agent_panel_entries_with_runtimes(
                         primary_label: workspace_label.clone(),
                         primary_tab_label: show_tab.then_some(detail.tab_label),
                         pane_label: detail.pane_label,
+                        manual_label: detail.manual_label,
+                        agent_name: detail.agent_name,
                         terminal_title: detail.terminal_title,
                         terminal_title_stripped: detail.terminal_title_stripped,
                         agent_label: Some(detail.agent_label),
@@ -850,8 +856,51 @@ pub(crate) fn collapsed_sidebar_sections(area: Rect) -> (Rect, Option<u16>, Rect
     (ws_area, Some(divider_y), detail_area)
 }
 
+/// Name style for a collapsed sidebar hover tooltip (the primary label).
+fn collapsed_hover_name_style(p: &Palette) -> Style {
+    Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+}
+
+/// Secondary style for a collapsed sidebar hover tooltip (tab, agent, branch,
+/// and other trailing context in the fallback line).
+fn collapsed_hover_secondary_style(p: &Palette) -> Style {
+    Style::default().fg(p.overlay0)
+}
+
+/// Whether the mouse rests on the collapsed sidebar row at screen row `y`.
+fn hovering_collapsed_row(app: &AppState, area: Rect, y: u16) -> bool {
+    app.last_mouse_pos
+        .is_some_and(|(mx, my)| my == y && mx >= area.x && mx < area.x + area.width)
+}
+
+/// Queue one hover tooltip for a collapsed sidebar row. The collapsed sidebar
+/// is only wide enough for a status icon, so the box floats just to the right
+/// of it, spilling over the panes exactly like the expanded tooltips do.
+fn push_collapsed_hover_tooltip(
+    hover_tooltips: &mut Vec<HoverTooltip>,
+    spans: Vec<(String, Style)>,
+    bg: Color,
+    area: Rect,
+    y: u16,
+) {
+    if spans.is_empty() {
+        return;
+    }
+    hover_tooltips.push(HoverTooltip {
+        spans,
+        bg,
+        row: y,
+        col: area.x + area.width,
+    });
+}
+
 /// Collapsed sidebar: workspace glance on top, compact agent list below.
-pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: Rect) {
+pub(super) fn render_sidebar_collapsed(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    hover_tooltips: &mut Vec<HoverTooltip>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -911,6 +960,29 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             }
         }
 
+        if hovering_collapsed_row(app, area, y) {
+            let bg = if is_selected {
+                p.selection_bg
+            } else if is_active {
+                p.active_row_bg
+            } else {
+                p.sidebar_bg
+            };
+            push_collapsed_hover_tooltip(
+                hover_tooltips,
+                collapsed_space_hover_spans(
+                    app,
+                    ws,
+                    collapsed_hover_name_style(p),
+                    collapsed_hover_secondary_style(p),
+                    p,
+                ),
+                bg,
+                area,
+                y,
+            );
+        }
+
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("{:<2}", visible_idx + 1), num_style),
@@ -960,6 +1032,27 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
                 for x in detail_content_area.x..detail_content_area.x + detail_content_area.width {
                     buf[(x, y)].set_style(Style::default().bg(p.active_row_bg));
                 }
+            }
+
+            if hovering_collapsed_row(app, area, y) {
+                let bg = if is_active {
+                    p.active_row_bg
+                } else {
+                    p.sidebar_bg
+                };
+                push_collapsed_hover_tooltip(
+                    hover_tooltips,
+                    collapsed_agent_hover_spans(
+                        app,
+                        detail,
+                        collapsed_hover_name_style(p),
+                        collapsed_hover_secondary_style(p),
+                        p,
+                    ),
+                    bg,
+                    area,
+                    y,
+                );
             }
 
             frame.render_widget(
@@ -1300,6 +1393,108 @@ fn hover_tooltip_spans(spans: &[Span<'static>]) -> Vec<(String, Style)> {
         .iter()
         .map(|span| (span.content.to_string(), span.style))
         .collect()
+}
+
+/// Flatten an item's resolved rows into a single hover line, joining each
+/// non-icon token with " · ". The status icon is already visible on the
+/// collapsed row, so it is dropped. This is the "what is shown right now"
+/// fallback for the collapsed sidebar hover tooltip, mirroring the text the
+/// expanded sidebar would render for the same item.
+fn collapsed_full_line_spans(
+    rows: &[Vec<ResolvedToken>],
+    name_style: Style,
+    secondary_style: Style,
+    p: &Palette,
+) -> Vec<(String, Style)> {
+    let sep_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
+    let mut line: Vec<(String, Style)> = Vec::new();
+    for row in rows {
+        let filtered = row
+            .iter()
+            .filter(|token| !matches!(token.kind, ResolvedTokenKind::StateIcon))
+            .cloned()
+            .collect::<Vec<_>>();
+        if filtered.is_empty() {
+            continue;
+        }
+        // Unbudgeted so nothing is truncated; the separators between tokens are
+        // the same ones the expanded rows use.
+        let spans = resolved_token_spans(
+            &filtered,
+            ("", Style::default()),
+            name_style,
+            name_style,
+            secondary_style,
+            secondary_style,
+            p,
+            usize::MAX,
+        );
+        if spans.is_empty() {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push((" · ".to_string(), sep_style));
+        }
+        line.extend(
+            spans
+                .into_iter()
+                .map(|span| (span.content.to_string(), span.style)),
+        );
+    }
+    line
+}
+
+/// The hover line for a collapsed agent pane item. Precedence: a manually
+/// assigned name wins, then the agent's self-generated name, then the same
+/// text the expanded agents pane would show for this pane.
+fn collapsed_agent_hover_spans(
+    app: &AppState,
+    entry: &AgentPanelEntry,
+    name_style: Style,
+    secondary_style: Style,
+    p: &Palette,
+) -> Vec<(String, Style)> {
+    if let Some(manual) = entry.manual_label.as_deref().filter(|s| !s.is_empty()) {
+        return vec![(manual.to_string(), name_style)];
+    }
+    if let Some(agent) = entry.agent_name.as_deref().filter(|s| !s.is_empty()) {
+        return vec![(agent.to_string(), name_style)];
+    }
+    collapsed_full_line_spans(
+        &resolved_agent_rows(app, entry),
+        name_style,
+        secondary_style,
+        p,
+    )
+}
+
+/// The hover line for a collapsed workspace/space item. Precedence: a manually
+/// assigned custom name wins, otherwise the same text the expanded spaces pane
+/// would show (name, branch, and git status).
+fn collapsed_space_hover_spans(
+    app: &AppState,
+    ws: &crate::workspace::Workspace,
+    name_style: Style,
+    secondary_style: Style,
+    p: &Palette,
+) -> Vec<(String, Style)> {
+    if let Some(custom) = ws.custom_name.as_deref().filter(|s| !s.is_empty()) {
+        return vec![(custom.to_string(), name_style)];
+    }
+    let (state, seen) = ws.aggregate_state(&app.terminals);
+    let token_values = ws.metadata_tokens.values();
+    let rows = tokens::space_rows(
+        &app.sidebar_spaces,
+        SpaceTokenContext {
+            workspace: &ws.display_name_from_terminals(&app.terminals),
+            branch: ws.branch().as_deref(),
+            state_text: state_label(state, seen),
+            ahead_behind: ws.git_ahead_behind(),
+            tokens: &token_values,
+            suppress_git_details: false,
+        },
+    );
+    collapsed_full_line_spans(&rows, name_style, secondary_style, p)
 }
 
 fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) -> Style {
@@ -1985,7 +2180,7 @@ mod tests {
 
         let mut collapsed = Terminal::new(TestBackend::new(26, 20)).unwrap();
         collapsed
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &mut Vec::new()))
             .unwrap();
         assert!(collapsed
             .backend()
@@ -2614,7 +2809,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .expect("test terminal should initialize");
 
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &mut Vec::new()))
             .expect("collapsed sidebar should render");
 
         let buffer = terminal.backend().buffer();
@@ -2655,7 +2850,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
             .expect("test terminal should initialize");
         terminal
-            .draw(|frame| render_sidebar_collapsed(app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(app, frame, area, &mut Vec::new()))
             .expect("collapsed sidebar should render");
         let buffer = terminal.backend().buffer();
         (0..rows)
@@ -2721,6 +2916,119 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         }
     }
 
+    /// One workspace with a single Claude pane, so the collapsed agent list has
+    /// exactly one row at a known position for the hover-tooltip tests.
+    fn collapsed_single_agent_app() -> (crate::app::state::AppState, crate::terminal::TerminalId) {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Claude);
+        (app, terminal_id)
+    }
+
+    fn collapsed_hover_tooltips(
+        app: &crate::app::state::AppState,
+        area: Rect,
+    ) -> Vec<super::super::HoverTooltip> {
+        let mut tooltips = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
+            .expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_sidebar_collapsed(app, frame, area, &mut tooltips))
+            .expect("collapsed sidebar should render");
+        tooltips
+    }
+
+    fn tooltip_text(tooltip: &super::super::HoverTooltip) -> String {
+        tooltip
+            .spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn collapsed_agent_hover_prefers_manual_name() {
+        let (mut app, terminal_id) = collapsed_single_agent_app();
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_manual_label("my-pane".into());
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("agent-pi".into());
+
+        let area = Rect::new(0, 0, 4, 14);
+        let (_, _, detail_area) = collapsed_sidebar_sections(area);
+        app.last_mouse_pos = Some((area.x, detail_area.y));
+
+        let tooltips = collapsed_hover_tooltips(&app, area);
+        assert_eq!(tooltips.len(), 1, "hovering the pane shows one tooltip");
+        assert_eq!(tooltip_text(&tooltips[0]), "my-pane");
+    }
+
+    #[test]
+    fn collapsed_agent_hover_falls_back_to_agent_name() {
+        let (mut app, terminal_id) = collapsed_single_agent_app();
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("agent-pi".into());
+
+        let area = Rect::new(0, 0, 4, 14);
+        let (_, _, detail_area) = collapsed_sidebar_sections(area);
+        app.last_mouse_pos = Some((area.x, detail_area.y));
+
+        let tooltips = collapsed_hover_tooltips(&app, area);
+        assert_eq!(tooltips.len(), 1);
+        assert_eq!(tooltip_text(&tooltips[0]), "agent-pi");
+    }
+
+    #[test]
+    fn collapsed_agent_hover_falls_back_to_expanded_line() {
+        let (mut app, _) = collapsed_single_agent_app();
+
+        let area = Rect::new(0, 0, 4, 14);
+        let (_, _, detail_area) = collapsed_sidebar_sections(area);
+        app.last_mouse_pos = Some((area.x, detail_area.y));
+
+        let tooltips = collapsed_hover_tooltips(&app, area);
+        assert_eq!(tooltips.len(), 1);
+        let text = tooltip_text(&tooltips[0]);
+        assert!(
+            text.contains("one") && text.contains("claude"),
+            "the fallback shows what the expanded pane would: {text:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_space_hover_prefers_custom_name() {
+        let (mut app, _) = collapsed_single_agent_app();
+        app.workspaces[0].custom_name = Some("My Space".into());
+
+        let area = Rect::new(0, 0, 4, 14);
+        let (ws_area, _, _) = collapsed_sidebar_sections(area);
+        app.last_mouse_pos = Some((area.x, ws_area.y));
+
+        let tooltips = collapsed_hover_tooltips(&app, area);
+        assert_eq!(tooltips.len(), 1, "hovering the space shows one tooltip");
+        assert_eq!(tooltip_text(&tooltips[0]), "My Space");
+    }
+
+    #[test]
+    fn collapsed_hover_is_empty_without_a_hovered_row() {
+        let (app, _) = collapsed_single_agent_app();
+        let area = Rect::new(0, 0, 4, 14);
+        // No mouse position recorded: nothing is hovered, so nothing is queued.
+        let tooltips = collapsed_hover_tooltips(&app, area);
+        assert!(tooltips.is_empty());
+    }
+
     #[test]
     fn collapsed_sidebar_keeps_workspace_status_visible_for_two_digit_positions() {
         let mut app = crate::app::state::AppState::test_new();
@@ -2743,7 +3051,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .expect("test terminal should initialize");
 
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &mut Vec::new()))
             .expect("collapsed sidebar should render");
 
         let tenth_row = workspace_area.y + 9;
@@ -2784,7 +3092,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .expect("test terminal should initialize");
 
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &mut Vec::new()))
             .expect("collapsed sidebar should render");
 
         let tenth_row = detail_area.y + 9;
@@ -2834,7 +3142,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .expect("test terminal should initialize");
 
         terminal
-            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area, &mut Vec::new()))
             .expect("collapsed sidebar should render");
 
         let buffer = terminal.backend().buffer();

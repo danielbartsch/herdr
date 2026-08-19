@@ -13,6 +13,12 @@ pub struct PaneDetail {
     pub tab_label: String,
     pub label: String,
     pub pane_label: Option<String>,
+    /// The name the user assigned to this pane, if any. Kept separate from
+    /// `pane_label` (which folds in the terminal-reported title) so callers can
+    /// honor a manual name on its own.
+    pub manual_label: Option<String>,
+    /// The name the agent generated for itself, if any.
+    pub agent_name: Option<String>,
     pub terminal_title: Option<String>,
     pub terminal_title_stripped: Option<String>,
     pub agent_label: String,
@@ -56,6 +62,8 @@ impl Tab {
                     pane_label: terminal
                         .effective_title()
                         .or_else(|| terminal.manual_label.clone()),
+                    manual_label: terminal.manual_label.clone(),
+                    agent_name: terminal.agent_name.clone(),
                     terminal_title: terminal.terminal_title.clone(),
                     terminal_title_stripped: terminal.terminal_title_stripped(),
                     agent_label,

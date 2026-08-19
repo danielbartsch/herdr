@@ -572,7 +572,7 @@ fn render_navigation_chrome(
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
     } else if app.view.sidebar_rect.width > 0 {
         if app.sidebar_collapsed {
-            render_sidebar_collapsed(app, frame, app.view.sidebar_rect);
+            render_sidebar_collapsed(app, frame, app.view.sidebar_rect, hover_tooltips);
         } else {
             render_sidebar(
                 app,
