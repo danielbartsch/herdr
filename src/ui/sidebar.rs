@@ -1665,11 +1665,14 @@ fn render_agent_detail(
         }
 
         let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
-        let row_style = if is_active {
-            Style::default().bg(p.active_row_bg)
+        // The row's background — reused for the row fill and the hover tooltip so
+        // hovering preserves it, exactly like the spaces section's `card_bg`.
+        let row_bg = if is_active {
+            p.active_row_bg
         } else {
-            Style::default()
+            Color::Reset
         };
+        let row_style = Style::default().bg(row_bg);
         let name_style = if is_active {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
@@ -1680,7 +1683,9 @@ fn render_agent_detail(
         } else {
             Style::default().fg(label_color).add_modifier(Modifier::DIM)
         };
-        let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
+        // Match the spaces pane's secondary-line style so the agents pane
+        // second line reads the same in dark terminals (no DIM darkening).
+        let agent_style = Style::default().fg(if is_active { p.mauve } else { p.overlay0 });
         let state_icon = state_icon(detail.state, detail.seen, app.status_indicators, p);
 
         // Same rule as the spaces section: hovering any row of the entry
@@ -1721,11 +1726,7 @@ fn render_agent_detail(
                 entry_truncated |= spans_text(&full_spans) != spans_text(&token_spans);
                 entry_tooltips.push(HoverTooltip {
                     spans: hover_tooltip_spans(&full_spans),
-                    bg: if is_active {
-                        p.surface_dim
-                    } else {
-                        Color::Reset
-                    },
+                    bg: row_bg,
                     row: row_y + row_index as u16,
                     col: body.x + prefix_width,
                 });
