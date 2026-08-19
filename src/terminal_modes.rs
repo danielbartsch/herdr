@@ -25,6 +25,11 @@ pub(crate) fn set_host_kitty_keyboard_report_all<W: Write>(
     let mut flags = crate::input::ime_compatible_keyboard_enhancement_flags();
     if report_all_keys {
         flags |= crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+        // Report-all turns IME commits into CSI-u key events in terminals such
+        // as Ghostty. Ask the terminal to carry the committed text with them.
+        flags = crossterm::event::KeyboardEnhancementFlags::from_bits_retain(
+            flags.bits() | 0b0001_0000,
+        );
     }
     // Older iTerm2 releases clear the keyboard stack on SET, so a later pop
     // cannot restore the host state. Replace only Herdr's top entry instead.
@@ -58,8 +63,9 @@ mod tests {
         // flags (`\x1b[>{flags}u`). Flags are the IME-compatible set (5 =
         // DISAMBIGUATE_ESCAPE_CODES | REPORT_ALTERNATE_KEYS; REPORT_EVENT_TYPES is
         // deliberately excluded, see `ime_compatible_keyboard_enhancement_flags`),
-        // plus REPORT_ALL_KEYS (8) while report-all is on.
-        assert_eq!(output, b"\x1b[<1u\x1b[>13u\x1b[<1u\x1b[>5u");
+        // plus REPORT_ALL_KEYS (8) and REPORT_ASSOCIATED_TEXT (16) while report-all
+        // is on (5 | 8 | 16 = 29).
+        assert_eq!(output, b"\x1b[<1u\x1b[>29u\x1b[<1u\x1b[>5u");
     }
 
     #[test]
