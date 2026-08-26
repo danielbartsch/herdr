@@ -398,7 +398,20 @@ impl Default for AgentsSidebarConfig {
                 ],
                 vec![AgentSidebarToken::Agent],
             ],
-            rows_by_agent: BTreeMap::new(),
+            // For Claude panes, keep the manual tab name on line 1 and show
+            // Claude's auto-generated task summary (its stripped terminal
+            // title) on line 2 instead of the static agent label.
+            rows_by_agent: BTreeMap::from([(
+                "claude".to_string(),
+                vec![
+                    vec![
+                        AgentSidebarToken::StateIcon,
+                        AgentSidebarToken::Workspace,
+                        AgentSidebarToken::Tab,
+                    ],
+                    vec![AgentSidebarToken::TerminalTitleStripped],
+                ],
+            )]),
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
         }
     }
@@ -449,7 +462,18 @@ mod tests {
                 vec![AgentSidebarToken::Agent],
             ]
         );
-        assert!(config.agents.rows_by_agent.is_empty());
+        assert_eq!(
+            config.agents.rows_by_agent["claude"],
+            vec![
+                vec![
+                    AgentSidebarToken::StateIcon,
+                    AgentSidebarToken::Workspace,
+                    AgentSidebarToken::Tab,
+                ],
+                vec![AgentSidebarToken::TerminalTitleStripped],
+            ]
+        );
+        assert_eq!(config.agents.rows_by_agent.len(), 1);
         assert_eq!(config.agents.row_gap, 0);
         assert_eq!(
             config.spaces.rows,

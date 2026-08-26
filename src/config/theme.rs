@@ -56,10 +56,10 @@ pub(crate) fn canonical_theme_name(name: &str) -> Option<&'static str> {
 /// accent = "#f5c2e7"
 /// red = "#ff6188"
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
-    /// Built-in theme name. Default: "catppuccin".
+    /// Built-in theme name. Default: "gruvbox".
     pub name: Option<String>,
     /// Follow host terminal light/dark appearance and switch between theme names.
     pub auto_switch: bool,
@@ -69,6 +69,18 @@ pub struct ThemeConfig {
     pub light_name: Option<String>,
     /// Custom overrides — applied on top of the selected base theme.
     pub custom: Option<CustomThemeColors>,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            name: Some("gruvbox".into()),
+            auto_switch: false,
+            dark_name: None,
+            light_name: None,
+            custom: None,
+        }
+    }
 }
 
 impl ThemeConfig {
@@ -344,7 +356,7 @@ active_row_bg = "#131415"
     #[test]
     fn theme_defaults_when_missing() {
         let config: Config = toml::from_str("").unwrap();
-        assert!(config.theme.name.is_none());
+        assert_eq!(config.theme.name.as_deref(), Some("gruvbox"));
         assert!(!config.theme.auto_switch);
         assert!(config.theme.dark_name.is_none());
         assert!(config.theme.light_name.is_none());

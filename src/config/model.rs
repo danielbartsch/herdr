@@ -312,7 +312,7 @@ pub fn validated_sidebar_bounds(min: u16, max: u16) -> Option<(u16, u16)> {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub onboarding: Option<bool>,
@@ -327,6 +327,27 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            // Ship with onboarding disabled so a fresh build matches the
+            // maintainer's own setup out of the box.
+            onboarding: Some(false),
+            theme: ThemeConfig::default(),
+            terminal: TerminalConfig::default(),
+            session: SessionConfig::default(),
+            server: ServerConfig::default(),
+            update: UpdateConfig::default(),
+            keys: KeysConfig::default(),
+            ui: UiConfig::default(),
+            worktrees: WorktreesConfig::default(),
+            advanced: AdvancedConfig::default(),
+            experimental: ExperimentalConfig::default(),
+            remote: RemoteConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -976,7 +997,7 @@ impl Default for RemoteConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     /// Allow launching herdr inside an existing herdr pane. Default: false.
@@ -1019,6 +1040,21 @@ pub struct ExperimentalConfig {
     /// elsewhere and a best-effort no-op if the switch fails.
     /// Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            allow_nested: false,
+            kitty_graphics: false,
+            // Restore pane scrollback across server restarts by default.
+            pane_history: true,
+            reveal_hidden_cursor_for_cjk_ime: false,
+            cjk_ime_agents: Vec::new(),
+            cjk_ime_cursor_shape: ImeCursorShape::default(),
+            switch_ascii_input_source_in_prefix: false,
+        }
+    }
 }
 
 impl Default for KeysConfig {
@@ -1120,7 +1156,7 @@ impl Default for UiConfig {
             pane_outer_borders: true,
             pane_scrollbars: true,
             pane_gaps: true,
-            show_agent_labels_on_pane_borders: false,
+            show_agent_labels_on_pane_borders: true,
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
             tab_bar_right: Vec::new(),
@@ -1152,7 +1188,7 @@ impl UiConfig {
 impl Default for ToastConfig {
     fn default() -> Self {
         Self {
-            delivery: ToastDelivery::Off,
+            delivery: ToastDelivery::System,
             delay_seconds: 1,
             herdr: HerdrToastConfig::default(),
             clipboard: ClipboardToastConfig::default(),
@@ -1397,7 +1433,7 @@ status_indicators = "symbols"
         assert!(default_config.ui.pane_outer_borders);
         assert!(default_config.ui.pane_scrollbars);
         assert!(default_config.ui.pane_gaps);
-        assert!(!default_config.ui.show_agent_labels_on_pane_borders);
+        assert!(default_config.ui.show_agent_labels_on_pane_borders);
         assert!(!default_config.ui.hide_tab_bar_when_single_tab);
         assert_eq!(
             default_config.ui.tab_bar_position,
@@ -1771,7 +1807,7 @@ position = "top-center"
     #[test]
     fn toast_config_defaults_preserve_existing_behavior_with_delay() {
         let config = Config::default();
-        assert_eq!(config.ui.toast.delivery, ToastDelivery::Off);
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::System);
         assert_eq!(config.ui.toast.delay_seconds, 1);
         assert_eq!(
             config.ui.toast.herdr.position,
@@ -1841,9 +1877,13 @@ delay_seconds = {}
     }
 
     #[test]
-    fn missing_onboarding_shows_setup() {
+    fn default_onboarding_is_skipped() {
         let config = Config::default();
-        assert!(config.should_show_onboarding());
+        assert!(!config.should_show_onboarding());
+
+        // Missing key in a parsed config falls back to the shipped default.
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(!empty.should_show_onboarding());
     }
 
     #[test]
@@ -1901,16 +1941,16 @@ headless_rows = 50
     }
 
     #[test]
-    fn pane_history_persistence_is_opt_in() {
-        assert!(!Config::default().experimental.pane_history);
+    fn pane_history_persistence_defaults_on_and_can_opt_out() {
+        assert!(Config::default().experimental.pane_history);
 
         let toml = r#"
 [experimental]
-pane_history = true
+pane_history = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
 
-        assert!(config.experimental.pane_history);
+        assert!(!config.experimental.pane_history);
     }
 
     #[test]
