@@ -72,7 +72,12 @@ pub(super) fn agent_rows(
                         AgentSidebarToken::TerminalTitleStripped => entry
                             .terminal_title_stripped
                             .clone()
-                            .map(ResolvedTokenKind::TerminalTitle),
+                            .filter(|title| !title.is_empty())
+                            // Prefix the Claude-generated title so it reads as a
+                            // title (not a branch name or other label).
+                            .map(|title| {
+                                ResolvedTokenKind::TerminalTitle(format!("🗨 {title}"))
+                            }),
                         AgentSidebarToken::Custom(name) => entry
                             .tokens
                             .get(name)
@@ -119,7 +124,9 @@ pub(super) fn space_rows(
                         }
                         SpaceSidebarToken::Branch if !context.suppress_git_details => context
                             .branch
-                            .map(|branch| ResolvedTokenKind::Branch(branch.to_string())),
+                            .filter(|branch| !branch.is_empty())
+                            // Prefix the branch name with a branch glyph.
+                            .map(|branch| ResolvedTokenKind::Branch(format!("⎇ {branch}"))),
                         SpaceSidebarToken::Branch => None,
                         SpaceSidebarToken::GitStatus if !context.suppress_git_details => context
                             .ahead_behind
@@ -254,7 +261,7 @@ mod tests {
             agent_rows(&config, &entry, "working"),
             vec![vec![
                 ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("⠋ raw title".into())),
-                ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("raw title".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("🗨 raw title".into())),
                 ResolvedToken::unstyled(ResolvedTokenKind::Custom("custom title".into())),
             ]]
         );
