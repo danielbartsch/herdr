@@ -34,7 +34,7 @@ RULE_KEYS = {
     "line_regex",
 }
 GATE_KEYS = {"all", "any", "not", "contains", "regex", "line_regex"}
-STATES = {"idle", "working", "blocked", "unknown"}
+STATES = {"idle", "working", "background", "blocked", "unknown"}
 REGION_RE = re.compile(
     r"^(whole_recent|whole_recent_without_current_prompt_marker|after_last_prompt_marker|"
     r"before_current_prompt_marker|current_prompt_block_marker|after_current_prompt_block_marker|"

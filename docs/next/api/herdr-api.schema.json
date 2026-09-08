@@ -70,14 +70,23 @@
           "type": "string"
         },
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "background",
+              "description": "Foreground idle, but a background task is still running.",
+              "type": "string"
+            }
+          ]
         },
         "EventData": {
           "oneOf": [
@@ -1367,14 +1376,23 @@
           "type": "object"
         },
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "background",
+              "description": "Foreground idle, but a background task is still running.",
+              "type": "string"
+            }
+          ]
         },
         "AgentTarget": {
           "properties": {
@@ -6394,14 +6412,23 @@
     "subscription_event": {
       "$defs": {
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "background",
+              "description": "Foreground idle, but a background task is still running.",
+              "type": "string"
+            }
+          ]
         },
         "PaneAgentStatusChangedEvent": {
           "properties": {
@@ -6824,14 +6851,23 @@
           "type": "string"
         },
         "AgentStatus": {
-          "enum": [
-            "idle",
-            "working",
-            "blocked",
-            "done",
-            "unknown"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "idle",
+                "working",
+                "blocked",
+                "done",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "background",
+              "description": "Foreground idle, but a background task is still running.",
+              "type": "string"
+            }
+          ]
         },
         "ClientWindowTitleReason": {
           "enum": [

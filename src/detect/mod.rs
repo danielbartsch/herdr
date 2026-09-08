@@ -13,6 +13,10 @@ pub enum AgentState {
     Idle,
     /// Agent is actively working/processing.
     Working,
+    /// Foreground is idle/waiting, but the agent has a background task running
+    /// (e.g. background agents or MCP tasks). Rendered like working but with its
+    /// own glyph, so it reads as "idle, with something still running".
+    Background,
     /// Agent needs human input and is blocked on a response.
     Blocked,
     /// Plain shell or unrecognized program.

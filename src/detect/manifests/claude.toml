@@ -1,7 +1,7 @@
 id = "claude"
-version = "2026.09.04.1"
+version = "2026.09.08.1"
 min_engine_version = 2
-updated_at = "2026-09-04T00:00:00Z"
+updated_at = "2026-09-08T00:00:00Z"
 aliases = ["claude-code"]
 
 [[rules]]
@@ -48,6 +48,27 @@ not = [
   { contains = ["do you want to allow this connection?"] },
   { contains = ["tab to amend"] },
   { contains = ["ctrl+e to explain"] },
+]
+
+# Foreground turn ended but one or more shells are still running in the
+# background. Claude shows a "· N shell" chip in the footer (and "N shell still
+# running" in the activity summary). This is "idle, with a shell running", so it
+# ranks above the idle prompt box (950) to win over plain idle, and the `not`
+# gates keep it from firing during a live turn or a blocking prompt (whose
+# footers sit below this rule's priority): an active turn or a running
+# background agent still reads as working, and a permission prompt stays blocked.
+[[rules]]
+id = "background_shell"
+state = "background"
+priority = 960
+region = "bottom_non_empty_lines(6)"
+line_regex = ['(?i)·\s+[1-9][0-9]*\s+shells?\b']
+not = [
+  { contains = ["esc to interrupt"] },
+  { contains = ["esc to cancel"] },
+  { contains = ["do you want to proceed"] },
+  { contains = ["enter to confirm"] },
+  { contains = ["enter to select"] },
 ]
 
 [[rules]]

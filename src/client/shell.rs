@@ -213,16 +213,19 @@ fn status_icon(
     use crate::api::schema::AgentStatus;
     use crate::config::StatusIndicatorStyle;
     match (style, status) {
+        // A background task uses its own glyph in both styles, so an idle agent
+        // that is still running something reads distinctly from a plain spinner.
+        (_, AgentStatus::Background) => "◯",
         (
             StatusIndicatorStyle::Dots,
             AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done,
         ) => "●",
-        (StatusIndicatorStyle::Dots, AgentStatus::Idle) => "○",
+        (StatusIndicatorStyle::Dots, AgentStatus::Idle) => "◌",
         (StatusIndicatorStyle::Dots, AgentStatus::Unknown) => "·",
         (StatusIndicatorStyle::Symbols, AgentStatus::Blocked) => "×",
         (StatusIndicatorStyle::Symbols, AgentStatus::Working) => "◐",
         (StatusIndicatorStyle::Symbols, AgentStatus::Done) => "✓",
-        (StatusIndicatorStyle::Symbols, AgentStatus::Idle) => "○",
+        (StatusIndicatorStyle::Symbols, AgentStatus::Idle) => "◌",
         (StatusIndicatorStyle::Symbols, AgentStatus::Unknown) => "·",
     }
 }
@@ -234,9 +237,12 @@ fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {
 fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {
     use crate::api::schema::AgentStatus;
     match status {
-        AgentStatus::Blocked => 4,
-        AgentStatus::Done => 3,
-        AgentStatus::Working => 2,
+        AgentStatus::Blocked => 5,
+        AgentStatus::Done => 4,
+        AgentStatus::Working => 3,
+        // Idle foreground with a background task: more than idle, less than an
+        // actively working foreground.
+        AgentStatus::Background => 2,
         AgentStatus::Idle => 1,
         AgentStatus::Unknown => 0,
     }
@@ -246,6 +252,7 @@ fn status_text(status: crate::api::schema::AgentStatus) -> &'static str {
     use crate::api::schema::AgentStatus;
     match status {
         AgentStatus::Working => "working",
+        AgentStatus::Background => "background",
         AgentStatus::Blocked => "blocked",
         AgentStatus::Done => "done",
         AgentStatus::Idle => "idle",
@@ -259,7 +266,8 @@ fn status_color(
 ) -> ratatui::style::Color {
     use crate::api::schema::AgentStatus;
     match status {
-        AgentStatus::Working => palette.yellow,
+        // Background tasks reuse the working color, differing only by glyph.
+        AgentStatus::Working | AgentStatus::Background => palette.yellow,
         AgentStatus::Blocked => palette.red,
         AgentStatus::Done => palette.teal,
         AgentStatus::Idle => palette.green,

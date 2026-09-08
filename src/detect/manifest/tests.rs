@@ -660,9 +660,11 @@ fn osc_explain(
 // --- Claude OSC rules ---
 
 #[test]
-fn claude_idle_prompt_with_background_shell_is_idle() {
+fn claude_idle_prompt_with_background_shell_is_background() {
     // Captured from Claude Code 2.1.251 after its foreground turn ended while
-    // a long-lived background shell remained active (issue #3414).
+    // a long-lived background shell remained active (issue #3414). The pane is
+    // idle in the foreground but a shell is still running, so it reads as the
+    // background state (◯), not plain idle.
     let screen = concat!(
         "✻ Sautéed for 10s · 1 shell still running\n\n",
         "──────────────────────────────────────────────────────── WINDOWS ─\n",
@@ -672,17 +674,37 @@ fn claude_idle_prompt_with_background_shell_is_idle() {
     );
     let result = osc_explain(Agent::Claude, screen, "", "");
 
-    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(result.state, AgentState::Background);
     assert_eq!(
         result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
-        Some("live_prompt_box")
+        Some("background_shell")
     );
-    assert!(result.visible_idle);
     assert!(!result.visible_working);
 }
 
 #[test]
-fn claude_background_shell_without_foreground_evidence_is_idle_fallback() {
+fn claude_idle_prompt_with_waiting_background_agents_remains_working() {
+    // A running background AGENT is genuine work, so it keeps the working badge
+    // even though the foreground prompt is idle (only a backgrounded shell earns
+    // the background state).
+    let screen = concat!(
+        "· Waiting for 2 background agents to finish\n\n",
+        "──────────────────────────────────────────────────────────────\n",
+        "❯\n",
+        "──────────────────────────────────────────────────────────────\n",
+        "  ⏵⏵ auto mode on · ← for agents                             /rc\n",
+    );
+    let result = osc_explain(Agent::Claude, screen, "", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("background_agents_working")
+    );
+}
+
+#[test]
+fn claude_background_shell_footer_alone_is_background() {
     let result = osc_explain(
         Agent::Claude,
         "  ⏵⏵ auto mode on · 1 shell · ← for agents\n",
@@ -690,11 +712,10 @@ fn claude_background_shell_without_foreground_evidence_is_idle_fallback() {
         "",
     );
 
-    assert_eq!(result.state, AgentState::Idle);
-    assert_eq!(result.matched_rule, None);
+    assert_eq!(result.state, AgentState::Background);
     assert_eq!(
-        result.fallback_reason.as_deref(),
-        Some(DEFAULT_KNOWN_AGENT_IDLE_FALLBACK)
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("background_shell")
     );
     assert!(!result.visible_working);
 }

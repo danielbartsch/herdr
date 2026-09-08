@@ -217,6 +217,7 @@ struct CompiledGate {
 enum ManifestState {
     Idle,
     Working,
+    Background,
     Blocked,
     Unknown,
 }
@@ -226,6 +227,7 @@ impl From<ManifestState> for AgentState {
         match value {
             ManifestState::Idle => AgentState::Idle,
             ManifestState::Working => AgentState::Working,
+            ManifestState::Background => AgentState::Background,
             ManifestState::Blocked => AgentState::Blocked,
             ManifestState::Unknown => AgentState::Unknown,
         }
@@ -823,6 +825,7 @@ pub fn agent_state_label(state: AgentState) -> &'static str {
     match state {
         AgentState::Idle => "idle",
         AgentState::Working => "working",
+        AgentState::Background => "background",
         AgentState::Blocked => "blocked",
         AgentState::Unknown => "unknown",
     }

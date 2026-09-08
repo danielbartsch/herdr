@@ -160,6 +160,8 @@ pub enum PaneAgentState {
 pub enum AgentStatus {
     Idle,
     Working,
+    /// Foreground idle, but a background task is still running.
+    Background,
     Blocked,
     Done,
     Unknown,

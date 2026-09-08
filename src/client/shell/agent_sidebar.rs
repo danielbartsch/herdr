@@ -162,8 +162,9 @@ const AGENT_LEGEND_CHIP_GAP: u16 = 2;
 /// The status/label pairs shown in the agents-pane legend, in display order.
 /// One row per meaningfully distinct glyph/color. "none" spells out `Unknown`
 /// (no detected agent / plain shell) so every glyph stays distinct.
-const STATUS_LEGEND: [(crate::api::schema::AgentStatus, &str); 5] = [
+const STATUS_LEGEND: [(crate::api::schema::AgentStatus, &str); 6] = [
     (crate::api::schema::AgentStatus::Working, "working"),
+    (crate::api::schema::AgentStatus::Background, "background"),
     (crate::api::schema::AgentStatus::Blocked, "blocked"),
     (crate::api::schema::AgentStatus::Done, "done"),
     (crate::api::schema::AgentStatus::Idle, "idle"),
@@ -584,6 +585,7 @@ fn sidebar_status_text(status: crate::api::schema::AgentStatus) -> &'static str 
         AgentStatus::Blocked => "blocked",
         AgentStatus::Done => "done",
         AgentStatus::Working => "working",
+        AgentStatus::Background => "background",
         AgentStatus::Idle | AgentStatus::Unknown => "idle",
     }
 }

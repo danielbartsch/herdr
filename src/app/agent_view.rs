@@ -389,12 +389,14 @@ fn status_name(state: crate::detect::AgentState, seen: bool) -> String {
         (crate::detect::AgentState::Idle, false) => AgentStatus::Done,
         (crate::detect::AgentState::Idle, true) => AgentStatus::Idle,
         (crate::detect::AgentState::Working, _) => AgentStatus::Working,
+        (crate::detect::AgentState::Background, _) => AgentStatus::Background,
         (crate::detect::AgentState::Blocked, _) => AgentStatus::Blocked,
         (crate::detect::AgentState::Unknown, _) => AgentStatus::Unknown,
     };
     match status {
         AgentStatus::Idle => "idle",
         AgentStatus::Working => "working",
+        AgentStatus::Background => "background",
         AgentStatus::Blocked => "blocked",
         AgentStatus::Done => "done",
         AgentStatus::Unknown => "unknown",
