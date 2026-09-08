@@ -683,25 +683,37 @@ pub(in crate::client::shell) fn workspace_rows(
     indented: bool,
     config: &SpacesSidebarConfig,
 ) -> Vec<Vec<crate::ui::ResolvedToken>> {
-    let label = if indented && !workspace.custom_label {
-        workspace
+    let is_linked_worktree = workspace
+        .worktree
+        .as_ref()
+        .is_some_and(|worktree| worktree.is_linked_worktree);
+    let label: String = if indented && !workspace.custom_label {
+        // Indented worktree children show their branch as the label (the branch
+        // token is suppressed for them), so carry the worktree glyph here.
+        let branch = workspace
             .branch
             .as_deref()
             .and_then(|branch| branch.strip_prefix("worktree/").or(Some(branch)))
-            .unwrap_or(&workspace.label)
+            .unwrap_or(&workspace.label);
+        if is_linked_worktree {
+            format!("⇱ {branch}")
+        } else {
+            branch.to_string()
+        }
     } else {
-        &workspace.label
+        workspace.label.clone()
     };
     let token_values = workspace.tokens.iter().cloned().collect::<HashMap<_, _>>();
     crate::ui::sidebar_space_rows(
         config,
         crate::ui::SpaceTokenContext {
-            workspace: label,
+            workspace: &label,
             branch: workspace.branch.as_deref(),
             state_text: status_text(status),
             ahead_behind: workspace.git_ahead_behind,
             tokens: &token_values,
             suppress_git_details: indented,
+            is_linked_worktree,
         },
     )
 }

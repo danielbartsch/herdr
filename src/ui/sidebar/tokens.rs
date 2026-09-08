@@ -131,6 +131,9 @@ pub(crate) struct SpaceTokenContext<'a> {
     pub(crate) ahead_behind: Option<(usize, usize)>,
     pub(crate) tokens: &'a std::collections::HashMap<String, String>,
     pub(crate) suppress_git_details: bool,
+    /// True when this space's checkout is a linked git worktree, so the branch
+    /// is rendered with the worktree glyph instead of the plain branch glyph.
+    pub(crate) is_linked_worktree: bool,
 }
 
 pub(crate) fn space_rows(
@@ -156,8 +159,17 @@ pub(crate) fn space_rows(
                         SpaceSidebarToken::Branch if !context.suppress_git_details => context
                             .branch
                             .filter(|branch| !branch.is_empty())
-                            // Prefix the branch name with a branch glyph.
-                            .map(|branch| ResolvedTokenKind::Branch(format!("⎇ {branch}"))),
+                            // Prefix the branch name with a glyph: the worktree
+                            // glyph when this space's branch lives in a linked
+                            // worktree, otherwise the plain branch glyph.
+                            .map(|branch| {
+                                let glyph = if context.is_linked_worktree {
+                                    "⇱"
+                                } else {
+                                    "⎇"
+                                };
+                                ResolvedTokenKind::Branch(format!("{glyph} {branch}"))
+                            }),
                         SpaceSidebarToken::Branch => None,
                         SpaceSidebarToken::GitStatus if !context.suppress_git_details => context
                             .ahead_behind
@@ -336,6 +348,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, dim = true }] }]]
                     state_text: "working",
                     ahead_behind: None,
                     suppress_git_details: false,
+                    is_linked_worktree: false,
                     tokens: &entry.tokens,
                 },
             );
@@ -494,6 +507,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, dim = true }] }]]
                     ahead_behind: Some((2, 1)),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    is_linked_worktree: false,
                 },
             ),
             vec![vec![
@@ -521,10 +535,46 @@ rows = [[{ token = "$load", rules = [{ lt = 50, dim = true }] }]]
                     ahead_behind: None,
                     tokens: &tokens,
                     suppress_git_details: false,
+                    is_linked_worktree: false,
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(
                 "2 changes".into()
+            ))]]
+        );
+    }
+
+    #[test]
+    fn branch_glyph_reflects_whether_the_space_is_a_linked_worktree() {
+        let config = SpacesSidebarConfig {
+            rows: vec![vec![SpaceSidebarToken::Branch]],
+            ..Default::default()
+        };
+        let branch_row = |is_linked_worktree| {
+            space_rows(
+                &config,
+                SpaceTokenContext {
+                    workspace: "repo",
+                    branch: Some("feature/login"),
+                    state_text: "idle",
+                    ahead_behind: None,
+                    tokens: &std::collections::HashMap::new(),
+                    suppress_git_details: false,
+                    is_linked_worktree,
+                },
+            )
+        };
+
+        assert_eq!(
+            branch_row(false),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Branch(
+                "⎇ feature/login".into()
+            ))]]
+        );
+        assert_eq!(
+            branch_row(true),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Branch(
+                "⇱ feature/login".into()
             ))]]
         );
     }
