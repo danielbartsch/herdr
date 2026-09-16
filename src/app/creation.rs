@@ -328,6 +328,23 @@ impl App {
                 .focused_pane_id()
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
+        // Where the agent actually operates, which can differ from the space's
+        // checkout identity (the first tab's root pane cwd). Prefer the directory
+        // the agent reported working in (e.g. a Claude hook's read/edit target), since
+        // agents that keep their process cwd fixed still report where they edit;
+        // otherwise fall back to the OS-inspected foreground cwd. Classified from
+        // the cache the periodic maintenance tick fills, so the filesystem walk
+        // never runs on the snapshot fanout path. `None` until the tick has
+        // classified the path. `foreground_cwd` stays the OS-inspected value.
+        let foreground_cwd =
+            ws.tabs[tab_idx].foreground_cwd_for_pane(pane_id, &self.terminal_runtimes);
+        let classified_dir = terminal
+            .reported_working_dir
+            .clone()
+            .or_else(|| foreground_cwd.clone());
+        let foreground_in_linked_worktree = classified_dir
+            .as_deref()
+            .and_then(|cwd| self.foreground_worktree_cache.get(cwd).copied());
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
@@ -337,9 +354,8 @@ impl App {
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
-            foreground_cwd: ws.tabs[tab_idx]
-                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
+            foreground_cwd: foreground_cwd.as_ref().map(|cwd| cwd.display().to_string()),
+            foreground_in_linked_worktree,
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),
             title: presentation.title,

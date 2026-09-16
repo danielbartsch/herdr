@@ -123,6 +123,12 @@ pub struct App {
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    /// Whether each agent pane's foreground working directory is inside a linked
+    /// git worktree, keyed by that directory. Filled by the periodic maintenance
+    /// tick (see `refresh_agent_worktree_status_if_due`) so the snapshot fanout
+    /// never walks the filesystem, and read back in `pane_info`.
+    pub(crate) foreground_worktree_cache: HashMap<std::path::PathBuf, bool>,
+    pub(crate) last_agent_worktree_refresh: Option<Instant>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
@@ -582,6 +588,8 @@ impl App {
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
+            foreground_worktree_cache: HashMap::new(),
+            last_agent_worktree_refresh: None,
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),

@@ -1623,6 +1623,20 @@ impl App {
         };
         let title = normalize_presentation_text(params.title);
         let display_agent = normalize_presentation_text(params.display_agent);
+        // The agent's current working directory (e.g. from a Claude PostToolUse
+        // hook). Sanitized like a presentation value but kept long enough for a
+        // real filesystem path; stored on the terminal and classified later.
+        let working_dir = params
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .map(|dir| {
+                dir.chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(4096)
+                    .collect::<String>()
+            })
+            .filter(|dir| !dir.is_empty());
         let applies_to_source = match params.applies_to_source {
             Some(applies_to_source) => match normalize_metadata_source(applies_to_source) {
                 Ok(applies_to_source) => Some(applies_to_source),
@@ -1654,6 +1668,7 @@ impl App {
             && display_agent.is_none()
             && state_labels.is_empty()
             && tokens.is_none()
+            && working_dir.is_none()
             && !params.clear_title
             && !params.clear_display_agent
             && !params.clear_state_labels
@@ -1691,6 +1706,17 @@ impl App {
         }
         if !terminal.metadata_report_sequence_is_fresh(&source, params.seq) {
             return encode_success(id, ResponseResult::Ok {});
+        }
+        // Store the reported working directory independently of the token/seq
+        // machinery: it is not a presentation token, and the periodic worktree
+        // classifier (not this handler) turns it into the sidebar indicator, so
+        // a working-dir-only report needs no presentation or token payload.
+        if let Some(working_dir) = working_dir {
+            let path = std::path::PathBuf::from(working_dir);
+            if terminal.reported_working_dir.as_deref() != Some(path.as_path()) {
+                terminal.reported_working_dir = Some(path);
+                terminal.revision = terminal.revision.saturating_add(1);
+            }
         }
         let metadata_agent = crate::terminal::TerminalState::metadata_report_agent(
             &source,
@@ -2296,6 +2322,7 @@ mod tests {
             clear_state_labels: false,
             seq: None,
             ttl_ms: None,
+            working_dir: None,
         }
     }
 

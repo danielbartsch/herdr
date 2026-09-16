@@ -620,6 +620,7 @@ mod tests {
             focused: true,
             cwd: None,
             foreground_cwd: None,
+            foreground_in_linked_worktree: None,
             label: None,
             agent: None,
             title: None,

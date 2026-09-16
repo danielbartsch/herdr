@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{App, GIT_REMOTE_STATUS_REFRESH_INTERVAL, GIT_REPO_DISCOVERY_REFRESH_INTERVAL};
 use crate::events::AppEvent;
 use crate::workspace::{GitStatusCacheEntry, GitStatusRefreshDemand, WorkspaceGitStatus};
+
+/// How often agent panes' foreground working directories are reclassified as
+/// living inside a linked git worktree. Cheap local filesystem reads, deduped by
+/// path, so a few seconds keeps the indicator responsive to `cd` without adding
+/// meaningful work.
+const AGENT_WORKTREE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkspaceGitRefreshItem {
@@ -109,6 +115,64 @@ impl App {
             }
         }
         demand
+    }
+
+    /// Reclassify each agent pane's foreground working directory as inside a
+    /// linked git worktree or not, caching the result by path. This is where the
+    /// agent actually operates, which can differ from the space's checkout
+    /// identity, so a worktree session is detected even when the agent `cd`'d
+    /// into a worktree unrelated to the space root.
+    ///
+    /// Runs on the periodic maintenance tick, never the render/snapshot fanout:
+    /// `git_space_metadata` walks parent directories and reads git files, so the
+    /// result is cached here and only `pane_info` reads it. Distinct foreground
+    /// directories are classified once, and rebuilding the map each pass prunes
+    /// closed panes and reflects both `cd`s and repository structure changes.
+    /// Returns whether the cache changed, so the caller can push a fresh snapshot.
+    pub(crate) fn refresh_agent_worktree_status_if_due(&mut self, now: Instant) -> bool {
+        if self.last_agent_worktree_refresh.is_some_and(|last| {
+            now.saturating_duration_since(last) < AGENT_WORKTREE_REFRESH_INTERVAL
+        }) {
+            return false;
+        }
+        self.last_agent_worktree_refresh = Some(now);
+
+        let mut classified: HashMap<PathBuf, bool> = HashMap::new();
+        for ws in &self.state.workspaces {
+            for tab in &ws.tabs {
+                for pane_id in tab.layout.pane_ids() {
+                    let Some(terminal) = tab
+                        .terminal_id(pane_id)
+                        .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+                    else {
+                        continue;
+                    };
+                    if !terminal.is_agent_terminal() {
+                        continue;
+                    }
+                    // Prefer the directory the agent reported working in (e.g. a
+                    // Claude hook's read/edit target); fall back to the OS-inspected
+                    // foreground cwd for agents that do not report one.
+                    let Some(cwd) = terminal
+                        .reported_working_dir
+                        .clone()
+                        .or_else(|| tab.foreground_cwd_for_pane(pane_id, &self.terminal_runtimes))
+                    else {
+                        continue;
+                    };
+                    classified.entry(cwd).or_insert_with_key(|path| {
+                        crate::workspace::git_space_metadata(path)
+                            .is_some_and(|space| space.is_linked_worktree)
+                    });
+                }
+            }
+        }
+
+        if classified == self.foreground_worktree_cache {
+            return false;
+        }
+        self.foreground_worktree_cache = classified;
+        true
     }
 
     fn workspace_git_refresh_items(

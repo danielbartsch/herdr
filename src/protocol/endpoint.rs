@@ -268,6 +268,32 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_pane_worktree_flag_defaults_false_for_older_servers() {
+        // An older server's snapshot omits `foreground_in_linked_worktree`; the
+        // field must default to false rather than reject the whole snapshot.
+        let mut snapshot = match snapshot_message(&snapshot()).unwrap() {
+            ServerMessage::EndpointControl { data, .. } => {
+                serde_json::from_str::<serde_json::Value>(&data).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        // A pane object as an older server would send it: no worktree field.
+        snapshot["panes"] = serde_json::json!([{
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "label": null,
+            "cwd": "/repo",
+            "foreground_cwd": "/repo",
+            "focused": true,
+            "right_click_passthrough": false
+        }]);
+
+        let decoded: ClientShellSnapshot = serde_json::from_value(snapshot).unwrap();
+        assert!(!decoded.panes[0].foreground_in_linked_worktree);
+    }
+
+    #[test]
     fn legacy_hello_defaults_to_an_active_surface() {
         let mut value = serde_json::to_value(hello()).unwrap();
         value.as_object_mut().unwrap().remove("surface_active");

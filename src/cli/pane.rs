@@ -1477,7 +1477,7 @@ fn pane_release_agent(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+        eprintln!("usage: herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--working-dir PATH] [--seq N] [--ttl-ms N]");
         return Ok(2);
     };
 
@@ -1494,6 +1494,7 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let mut clear_state_labels = false;
     let mut seq = None;
     let mut ttl_ms = None;
+    let mut working_dir = None;
 
     let mut index = 1;
     while index < args.len() {
@@ -1609,6 +1610,14 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
                 ttl_ms = Some(super::parse_u64_flag("--ttl-ms", value)?);
                 index += 2;
             }
+            "--working-dir" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --working-dir");
+                    return Ok(2);
+                };
+                working_dir = Some(value.clone());
+                index += 2;
+            }
             other => {
                 eprintln!("unknown option: {other}");
                 return Ok(2);
@@ -1663,6 +1672,7 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
         clear_state_labels,
         seq,
         ttl_ms,
+        working_dir,
     }))
 }
 

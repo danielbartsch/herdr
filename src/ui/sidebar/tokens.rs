@@ -62,6 +62,10 @@ pub(crate) struct AgentTokenContext<'a> {
     pub(crate) terminal_title_stripped: Option<&'a str>,
     pub(crate) canonical_agent: Option<crate::detect::Agent>,
     pub(crate) tokens: &'a std::collections::HashMap<String, String>,
+    /// True when the agent's foreground working directory (where it actually
+    /// operates, not the space's checkout identity) is inside a linked git
+    /// worktree, so the speech-bubble title is trailed with the worktree glyph.
+    pub(crate) is_linked_worktree: bool,
 }
 
 pub(crate) fn agent_rows(
@@ -103,9 +107,20 @@ pub(crate) fn agent_rows(
                         AgentSidebarToken::TerminalTitleStripped => context
                             .terminal_title_stripped
                             .filter(|title| !title.is_empty())
-                            // Prefix the Claude-generated title so it reads as a
-                            // title (not a branch name or other label).
-                            .map(|title| ResolvedTokenKind::TerminalTitle(format!("🗨 {title}"))),
+                            // Prefix the Claude-generated title with the
+                            // speech-bubble glyph so it reads as a title (not a
+                            // branch name or other label). When the agent's
+                            // space is a linked git worktree, trail the bubble
+                            // with the worktree glyph so a worktree session is
+                            // distinguishable at a glance.
+                            .map(|title| {
+                                let prefix = if context.is_linked_worktree {
+                                    "🗨 ⇱"
+                                } else {
+                                    "🗨"
+                                };
+                                ResolvedTokenKind::TerminalTitle(format!("{prefix} {title}"))
+                            }),
                         AgentSidebarToken::Custom(name) => context
                             .tokens
                             .get(name)
@@ -244,6 +259,7 @@ mod tests {
             terminal_title_stripped: entry.terminal_title_stripped.as_deref(),
             canonical_agent: entry.canonical_agent,
             tokens: &entry.tokens,
+            is_linked_worktree: false,
         }
     }
 
@@ -462,6 +478,34 @@ rows = [[{ token = "$load", rules = [{ lt = 50, dim = true }] }]]
                 ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("🗨 raw title".into())),
                 ResolvedToken::unstyled(ResolvedTokenKind::Custom("custom title".into())),
             ]]
+        );
+    }
+
+    #[test]
+    fn worktree_session_trails_the_speech_bubble_with_the_worktree_glyph() {
+        let mut entry = entry();
+        entry.terminal_title_stripped = Some("fixing auth".into());
+        let config = AgentsSidebarConfig {
+            rows: vec![vec![AgentSidebarToken::TerminalTitleStripped]],
+            ..Default::default()
+        };
+
+        // A plain (non-worktree) space keeps the bare speech bubble.
+        assert_eq!(
+            agent_rows(&config, context(&entry), "working"),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::TerminalTitle("🗨 fixing auth".into())
+            )]]
+        );
+
+        // A linked-worktree space trails the bubble with the worktree glyph.
+        let mut worktree_context = context(&entry);
+        worktree_context.is_linked_worktree = true;
+        assert_eq!(
+            agent_rows(&config, worktree_context, "working"),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::TerminalTitle("🗨 ⇱ fixing auth".into())
+            )]]
         );
     }
 

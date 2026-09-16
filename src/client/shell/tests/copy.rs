@@ -868,6 +868,7 @@ fn copy_mode_survives_mouse_motion_and_parks_across_focus_changes() {
         label: None,
         cwd: Some("/repo".into()),
         foreground_cwd: Some("/repo".into()),
+        foreground_in_linked_worktree: false,
         focused: true,
         right_click_passthrough: false,
     });

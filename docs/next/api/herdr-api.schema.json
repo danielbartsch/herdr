@@ -808,6 +808,13 @@
                 "null"
               ]
             },
+            "foreground_in_linked_worktree": {
+              "description": "Whether `foreground_cwd` is inside a linked git worktree (where the agent\nactually operates, which can differ from the space's checkout identity).\n`None` when it has not been classified yet.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "label": {
               "type": [
                 "string",
@@ -3170,6 +3177,13 @@
               "minimum": 1,
               "type": [
                 "integer",
+                "null"
+              ]
+            },
+            "working_dir": {
+              "description": "The directory the agent is currently working in (e.g. the directory of\nthe file it just read or edited). Herdr classifies it as main-checkout vs. linked\nworktree; unlike the OS-inspected `foreground_cwd`, this reflects where an\nagent that does not change its process cwd is actually operating.",
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -7997,6 +8011,13 @@
             "foreground_cwd": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "foreground_in_linked_worktree": {
+              "description": "Whether `foreground_cwd` is inside a linked git worktree (where the agent\nactually operates, which can differ from the space's checkout identity).\n`None` when it has not been classified yet.",
+              "type": [
+                "boolean",
                 "null"
               ]
             },

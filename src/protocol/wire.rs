@@ -1054,6 +1054,12 @@ pub struct ClientShellPane {
     pub label: Option<String>,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
+    /// True when the pane's foreground working directory is inside a linked git
+    /// worktree, i.e. where the agent actually operates (which can differ from
+    /// the space's checkout identity). Defaults to false for older servers that
+    /// do not report it.
+    #[serde(default)]
+    pub foreground_in_linked_worktree: bool,
     pub focused: bool,
     pub right_click_passthrough: bool,
 }
@@ -2675,6 +2681,7 @@ mod tests {
                 label: None,
                 cwd: Some("/repo".into()),
                 foreground_cwd: Some("/repo".into()),
+                foreground_in_linked_worktree: false,
                 focused: true,
                 right_click_passthrough: false,
             }],

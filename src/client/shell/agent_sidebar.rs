@@ -459,6 +459,11 @@ pub(super) fn agent_rows(
                     terminal_title_stripped: agent.terminal_title_stripped.as_deref(),
                     canonical_agent,
                     tokens: &tokens,
+                    // Where the agent operates (its pane's foreground cwd), not
+                    // the space's checkout identity: an agent that `cd`'d into a
+                    // worktree is flagged, one launched in a worktree space but
+                    // working elsewhere is not.
+                    is_linked_worktree: pane.is_some_and(|pane| pane.foreground_in_linked_worktree),
                 },
                 state_text,
             );

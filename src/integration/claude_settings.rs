@@ -17,44 +17,64 @@ use super::config_edit::{
 struct HookRemoval {
     event: &'static str,
     actions: &'static [&'static str],
+    /// When true, this hook is removed only on uninstall. Install leaves it in
+    /// place so a currently-managed hook (e.g. the `workdir` PostToolUse hook)
+    /// is not stripped-and-reinserted, keeping a re-install byte-exact.
+    uninstall_only: bool,
 }
 
 const HOOK_REMOVALS: &[HookRemoval] = &[
     HookRemoval {
         event: "PostToolUse",
         actions: &["working"],
+        uninstall_only: false,
+    },
+    // The `workdir` PostToolUse hook is currently managed (installed by
+    // `ensure_workdir_hook`), so only uninstall strips it.
+    HookRemoval {
+        event: "PostToolUse",
+        actions: &["workdir"],
+        uninstall_only: true,
     },
     HookRemoval {
         event: "PostToolUseFailure",
         actions: &["working"],
+        uninstall_only: false,
     },
     HookRemoval {
         event: "SubagentStop",
         actions: &["working"],
+        uninstall_only: false,
     },
     HookRemoval {
         event: "PermissionRequest",
         actions: &["blocked"],
+        uninstall_only: false,
     },
     HookRemoval {
         event: "SessionStart",
         actions: &["idle", "session"],
+        uninstall_only: false,
     },
     HookRemoval {
         event: "UserPromptSubmit",
         actions: &["working"],
+        uninstall_only: false,
     },
     HookRemoval {
         event: "PreToolUse",
         actions: &["working"],
+        uninstall_only: false,
     },
     HookRemoval {
         event: "Stop",
         actions: &["idle"],
+        uninstall_only: false,
     },
     HookRemoval {
         event: "SessionEnd",
         actions: &["release"],
+        uninstall_only: false,
     },
 ];
 
@@ -77,17 +97,22 @@ pub(crate) fn install(content: &str, settings_path: &Path, hook_path: &Path) -> 
         Some("*"),
     )?;
 
-    if desired == original {
-        return Ok(content.to_string());
-    }
+    let with_session = if desired == original {
+        content.to_string()
+    } else {
+        rewrite(
+            content,
+            settings_path,
+            hook_path,
+            EditKind::Install,
+            &desired,
+        )?
+    };
 
-    rewrite(
-        content,
-        settings_path,
-        hook_path,
-        EditKind::Install,
-        &desired,
-    )
+    // The SessionStart flow above is left untouched; the PostToolUse `workdir`
+    // hook (which reports where the agent is editing) is managed in a separate,
+    // idempotent pass so it does not disturb the single-canonical machinery.
+    ensure_workdir_hook(&with_session, settings_path, hook_path)
 }
 
 pub(crate) fn uninstall(
@@ -128,6 +153,11 @@ fn apply_value_removals(
 ) -> io::Result<bool> {
     let mut removed = false;
     for policy in HOOK_REMOVALS {
+        // `canonical` is set only when installing; skip uninstall-only policies
+        // so a managed hook is not stripped on install.
+        if policy.uninstall_only && canonical.is_some() {
+            continue;
+        }
         let commands = removal_commands(policy, hook_path);
         removed |= remove_value_event_commands(
             hooks,
@@ -223,7 +253,13 @@ fn rewrite(
         None if kind == EditKind::Install
             && direct_children_are_compact(&root_object.children()) =>
         {
-            let updated = append_hooks_property_compact(content, hook_path, settings_path)?;
+            let updated = append_hooks_property_compact(
+                content,
+                hook_path,
+                settings_path,
+                "SessionStart",
+                "session",
+            )?;
             return verify_updated(updated, settings_path, desired);
         }
         None if kind == EditKind::Install => root_object
@@ -236,6 +272,10 @@ fn rewrite(
     let canonical = canonical_hook_value(hook_path);
     let mut canonical_preserved = false;
     for policy in HOOK_REMOVALS {
+        // Managed (uninstall-only) hooks stay in place on install.
+        if policy.uninstall_only && kind == EditKind::Install {
+            continue;
+        }
         let commands = removal_commands(policy, hook_path);
         canonical_preserved |= remove_event_commands(
             &hooks,
@@ -253,15 +293,25 @@ fn rewrite(
                     io::Error::other("hook entries for SessionStart must be an array")
                 })?;
                 if direct_children_are_compact(&session_start.children()) {
-                    let updated =
-                        append_session_entry_compact(&root.to_string(), hook_path, settings_path)?;
+                    let updated = append_event_entry_compact(
+                        &root.to_string(),
+                        hook_path,
+                        settings_path,
+                        "SessionStart",
+                        "session",
+                    )?;
                     return verify_updated(updated, settings_path, desired);
                 }
                 session_start.append(canonical_hook_input(hook_path));
             }
             None if direct_children_are_compact(&hooks.children()) => {
-                let updated =
-                    append_session_property_compact(&root.to_string(), hook_path, settings_path)?;
+                let updated = append_event_property_compact(
+                    &root.to_string(),
+                    hook_path,
+                    settings_path,
+                    "SessionStart",
+                    "session",
+                )?;
                 return verify_updated(updated, settings_path, desired);
             }
             None => {
@@ -355,7 +405,11 @@ fn canonical_hook_value(hook_path: &Path) -> Value {
 }
 
 fn canonical_hook_input(hook_path: &Path) -> CstInputValue {
-    let command = hook_command(hook_path, Some("session"));
+    hook_entry_input(hook_path, "session")
+}
+
+fn hook_entry_input(hook_path: &Path, action: &str) -> CstInputValue {
+    let command = hook_command(hook_path, Some(action));
     json!({
         matcher: "*",
         hooks: [{
@@ -370,16 +424,20 @@ fn append_hooks_property_compact(
     content: &str,
     hook_path: &Path,
     settings_path: &Path,
+    event: &str,
+    action: &str,
 ) -> io::Result<String> {
     let root = parse_ast_root_object(content, settings_path)?;
-    let value = format!("{{\"SessionStart\":[{}]}}", canonical_hook_json(hook_path)?);
+    let value = format!("{{\"{event}\":[{}]}}", hook_entry_json(hook_path, action)?);
     Ok(append_object_property(content, &root, "hooks", &value))
 }
 
-fn append_session_property_compact(
+fn append_event_property_compact(
     content: &str,
     hook_path: &Path,
     settings_path: &Path,
+    event: &str,
+    action: &str,
 ) -> io::Result<String> {
     let root = parse_ast_root_object(content, settings_path)?;
     let hooks = root.get_object("hooks").ok_or_else(|| {
@@ -388,29 +446,26 @@ fn append_session_property_compact(
             settings_path.display()
         ))
     })?;
-    let value = format!("[{}]", canonical_hook_json(hook_path)?);
-    Ok(append_object_property(
-        content,
-        hooks,
-        "SessionStart",
-        &value,
-    ))
+    let value = format!("[{}]", hook_entry_json(hook_path, action)?);
+    Ok(append_object_property(content, hooks, event, &value))
 }
 
-fn append_session_entry_compact(
+fn append_event_entry_compact(
     content: &str,
     hook_path: &Path,
     settings_path: &Path,
+    event: &str,
+    action: &str,
 ) -> io::Result<String> {
     let root = parse_ast_root_object(content, settings_path)?;
-    let session_start = root
+    let entries = root
         .get_object("hooks")
-        .and_then(|hooks| hooks.get_array("SessionStart"))
-        .ok_or_else(|| io::Error::other("hook entries for SessionStart must be an array"))?;
+        .and_then(|hooks| hooks.get_array(event))
+        .ok_or_else(|| io::Error::other(format!("hook entries for {event} must be an array")))?;
     Ok(append_array_element(
         content,
-        session_start,
-        &canonical_hook_json(hook_path)?,
+        entries,
+        &hook_entry_json(hook_path, action)?,
     ))
 }
 
@@ -512,11 +567,129 @@ fn append_to_container(
     updated
 }
 
+#[cfg(test)]
 fn canonical_hook_json(hook_path: &Path) -> io::Result<String> {
-    let command = serde_json::to_string(&hook_command(hook_path, Some("session")))?;
+    hook_entry_json(hook_path, "session")
+}
+
+/// A `{matcher, hooks:[{type,command,timeout}]}` hook entry as compact JSON for
+/// the given asset action, matching the shape [`ensure_command_hook`] appends.
+fn hook_entry_json(hook_path: &Path, action: &str) -> io::Result<String> {
+    let command = serde_json::to_string(&hook_command(hook_path, Some(action)))?;
     Ok(format!(
         "{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":{command},\"timeout\":10}}]}}"
     ))
+}
+
+/// Idempotently ensure the PostToolUse `workdir` hook is present, inserting it
+/// with the same shape [`ensure_command_hook`] uses so a re-install is a
+/// byte-exact no-op. Kept separate from the SessionStart machinery so that
+/// single-canonical flow is undisturbed.
+fn ensure_workdir_hook(
+    content: &str,
+    settings_path: &Path,
+    hook_path: &Path,
+) -> io::Result<String> {
+    let original = parse_value(content, settings_path)?;
+    let mut desired = original.clone();
+    let hooks_map = ensure_hooks_object(
+        &mut desired,
+        settings_path,
+        "claude settings",
+        "claude settings hooks",
+    )?;
+    ensure_command_hook(
+        hooks_map,
+        "PostToolUse",
+        hook_command(hook_path, Some("workdir")),
+        10,
+        Some("*"),
+    )?;
+    if desired == original {
+        return Ok(content.to_string());
+    }
+
+    // Insert through the CST (compact-aware, like the SessionStart path) so the
+    // surrounding formatting is preserved in both compact and expanded files.
+    let root = CstRootNode::parse(content, &strict_parse_options()).map_err(|err| {
+        io::Error::other(format!(
+            "failed to parse {}: {err}",
+            settings_path.display()
+        ))
+    })?;
+    let root_value = root.value().ok_or_else(|| {
+        io::Error::other(format!(
+            "claude settings at {} must be a JSON object",
+            settings_path.display()
+        ))
+    })?;
+    let root_object = root_value.as_object().ok_or_else(|| {
+        io::Error::other(format!(
+            "claude settings at {} must be a JSON object",
+            settings_path.display()
+        ))
+    })?;
+
+    let hooks = match root_object.get("hooks") {
+        Some(property) => property.object_value().ok_or_else(|| {
+            io::Error::other(format!(
+                "claude settings hooks at {} must be a JSON object",
+                settings_path.display()
+            ))
+        })?,
+        None if direct_children_are_compact(&root_object.children()) => {
+            let updated = append_hooks_property_compact(
+                content,
+                hook_path,
+                settings_path,
+                "PostToolUse",
+                "workdir",
+            )?;
+            return verify_updated(updated, settings_path, &desired);
+        }
+        None => root_object
+            .append("hooks", CstInputValue::Object(Vec::new()))
+            .object_value()
+            .ok_or_else(|| io::Error::other("failed to create claude settings hooks object"))?,
+    };
+
+    match hooks.get("PostToolUse") {
+        Some(property) => {
+            let entries = property
+                .array_value()
+                .ok_or_else(|| io::Error::other("hook entries for PostToolUse must be an array"))?;
+            if direct_children_are_compact(&entries.children()) {
+                let updated = append_event_entry_compact(
+                    &root.to_string(),
+                    hook_path,
+                    settings_path,
+                    "PostToolUse",
+                    "workdir",
+                )?;
+                return verify_updated(updated, settings_path, &desired);
+            }
+            entries.append(hook_entry_input(hook_path, "workdir"));
+        }
+        None if direct_children_are_compact(&hooks.children()) => {
+            let updated = append_event_property_compact(
+                &root.to_string(),
+                hook_path,
+                settings_path,
+                "PostToolUse",
+                "workdir",
+            )?;
+            return verify_updated(updated, settings_path, &desired);
+        }
+        None => {
+            let entries = hooks
+                .append("PostToolUse", CstInputValue::Array(Vec::new()))
+                .array_value()
+                .ok_or_else(|| io::Error::other("failed to create PostToolUse hook array"))?;
+            entries.append(hook_entry_input(hook_path, "workdir"));
+        }
+    }
+
+    verify_updated(root.to_string(), settings_path, &desired)
 }
 
 fn verify_updated(updated: String, settings_path: &Path, desired: &Value) -> io::Result<String> {
@@ -631,41 +804,42 @@ mod tests {
     fn install_keeps_compact_containers_compact() {
         let (settings_path, hook_path) = paths();
         let canonical = canonical_hook_json(hook_path).unwrap();
+        let workdir = hook_entry_json(hook_path, "workdir").unwrap();
         let cases = [
             (
                 "{\"zeta\":{\"escaped\":\"\\u0061\",\"n\":1e+02},\"alpha\":1}\r\n",
                 format!(
-                    "{{\"zeta\":{{\"escaped\":\"\\u0061\",\"n\":1e+02}},\"alpha\":1,\"hooks\":{{\"SessionStart\":[{canonical}]}}}}\r\n"
+                    "{{\"zeta\":{{\"escaped\":\"\\u0061\",\"n\":1e+02}},\"alpha\":1,\"hooks\":{{\"SessionStart\":[{canonical}],\"PostToolUse\":[{workdir}]}}}}\r\n"
                 ),
             ),
             (
                 "{\"hooks\":{\"Notification\":[{\"matcher\":\"keep\",\"hooks\":[]}]}, \"alpha\":1}",
                 format!(
-                    "{{\"hooks\":{{\"Notification\":[{{\"matcher\":\"keep\",\"hooks\":[]}}],\"SessionStart\":[{canonical}]}}, \"alpha\":1}}"
+                    "{{\"hooks\":{{\"Notification\":[{{\"matcher\":\"keep\",\"hooks\":[]}}],\"SessionStart\":[{canonical}],\"PostToolUse\":[{workdir}]}}, \"alpha\":1}}"
                 ),
             ),
             (
                 "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"keep\",\"hooks\":[{\"type\":\"command\",\"command\":\"echo keep\"}]}]}}",
                 format!(
-                    "{{\"hooks\":{{\"SessionStart\":[{{\"matcher\":\"keep\",\"hooks\":[{{\"type\":\"command\",\"command\":\"echo keep\"}}]}},{canonical}]}}}}"
+                    "{{\"hooks\":{{\"SessionStart\":[{{\"matcher\":\"keep\",\"hooks\":[{{\"type\":\"command\",\"command\":\"echo keep\"}}]}},{canonical}],\"PostToolUse\":[{workdir}]}}}}"
                 ),
             ),
             (
                 "{\"zeta\":{\n  \"x\":1\n},\"alpha\":1}",
                 format!(
-                    "{{\"zeta\":{{\n  \"x\":1\n}},\"alpha\":1,\"hooks\":{{\"SessionStart\":[{canonical}]}}}}"
+                    "{{\"zeta\":{{\n  \"x\":1\n}},\"alpha\":1,\"hooks\":{{\"SessionStart\":[{canonical}],\"PostToolUse\":[{workdir}]}}}}"
                 ),
             ),
             (
                 "{\"hooks\":{\"Notification\":[\n  {\"matcher\":\"keep\",\"hooks\":[]}\n]},\"alpha\":1}",
                 format!(
-                    "{{\"hooks\":{{\"Notification\":[\n  {{\"matcher\":\"keep\",\"hooks\":[]}}\n],\"SessionStart\":[{canonical}]}},\"alpha\":1}}"
+                    "{{\"hooks\":{{\"Notification\":[\n  {{\"matcher\":\"keep\",\"hooks\":[]}}\n],\"SessionStart\":[{canonical}],\"PostToolUse\":[{workdir}]}},\"alpha\":1}}"
                 ),
             ),
             (
                 "{\"hooks\":{\"SessionStart\":[{\n  \"matcher\":\"keep\",\n  \"hooks\":[{\"type\":\"command\",\"command\":\"echo keep\"}]\n}]}}",
                 format!(
-                    "{{\"hooks\":{{\"SessionStart\":[{{\n  \"matcher\":\"keep\",\n  \"hooks\":[{{\"type\":\"command\",\"command\":\"echo keep\"}}]\n}},{canonical}]}}}}"
+                    "{{\"hooks\":{{\"SessionStart\":[{{\n  \"matcher\":\"keep\",\n  \"hooks\":[{{\"type\":\"command\",\"command\":\"echo keep\"}}]\n}},{canonical}],\"PostToolUse\":[{workdir}]}}}}"
                 ),
             ),
         ];
@@ -679,8 +853,9 @@ mod tests {
     fn install_is_a_byte_exact_noop_for_a_canonical_hook() {
         let (settings_path, hook_path) = paths();
         let command = serde_json::to_string(&hook_command(hook_path, Some("session"))).unwrap();
+        let workdir = serde_json::to_string(&hook_command(hook_path, Some("workdir"))).unwrap();
         let input = format!(
-            "{{\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"timeout\":10,\"command\":{command},\"type\":\"command\"}}],\"matcher\":\"*\"}}]}},\"escaped\":\"\\u0061\"}}  \r\n\r\n"
+            "{{\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"timeout\":10,\"command\":{command},\"type\":\"command\"}}],\"matcher\":\"*\"}}],\"PostToolUse\":[{{\"hooks\":[{{\"command\":{workdir},\"type\":\"command\"}}],\"matcher\":\"x\"}}]}},\"escaped\":\"\\u0061\"}}  \r\n\r\n"
         );
 
         let updated = install(&input, settings_path, hook_path).unwrap();
@@ -703,7 +878,17 @@ mod tests {
         ]
         .concat();
         let input = ["{\"hooks\":{", &session_start, ",", &old_event, "}}"].concat();
-        let expected = ["{\"hooks\":{", &session_start, "}}"].concat();
+        // The stale `working` PostToolUse hook is removed and the managed
+        // `workdir` PostToolUse hook is appended in its place.
+        let workdir = hook_entry_json(hook_path, "workdir").unwrap();
+        let expected = [
+            "{\"hooks\":{",
+            &session_start,
+            ",\"PostToolUse\":[",
+            &workdir,
+            "]}}",
+        ]
+        .concat();
 
         let updated = install(&input, settings_path, hook_path).unwrap();
 
@@ -778,6 +963,31 @@ mod tests {
             .contains("                {  \"type\" : \"command\", \"command\" : \"echo keep\"  }"));
         assert!(updated.starts_with("{\n    \"before\" : \"\\u0061\","));
         assert!(updated.ends_with("    \"after\" : 1e+02\n}\n\n"));
+    }
+
+    #[test]
+    fn install_adds_both_managed_hooks_and_uninstall_removes_them() {
+        let (settings_path, hook_path) = paths();
+        let workdir_command = hook_command(hook_path, Some("workdir"));
+        let session_command = hook_command(hook_path, Some("session"));
+
+        let installed = install("{}", settings_path, hook_path).unwrap();
+        let parsed: Value = serde_json::from_str(&installed).unwrap();
+        assert_eq!(parsed["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            Value::String(workdir_command.clone())
+        );
+
+        // A second install over the result is a byte-exact no-op.
+        assert_eq!(
+            install(&installed, settings_path, hook_path).unwrap(),
+            installed
+        );
+
+        let uninstalled = uninstall(&installed, settings_path, hook_path).unwrap();
+        assert!(!uninstalled.contains(&workdir_command));
+        assert!(!uninstalled.contains(&session_command));
     }
 
     #[test]

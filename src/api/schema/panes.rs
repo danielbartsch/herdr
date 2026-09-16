@@ -503,6 +503,12 @@ pub struct PaneReportMetadataParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 86_400_000))]
     pub ttl_ms: Option<u64>,
+    /// The directory the agent is currently working in (e.g. the directory of
+    /// the file it just read or edited). Herdr classifies it as main-checkout vs. linked
+    /// worktree; unlike the OS-inspected `foreground_cwd`, this reflects where an
+    /// agent that does not change its process cwd is actually operating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -534,6 +540,11 @@ pub struct PaneInfo {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
+    /// Whether `foreground_cwd` is inside a linked git worktree (where the agent
+    /// actually operates, which can differ from the space's checkout identity).
+    /// `None` when it has not been classified yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_in_linked_worktree: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

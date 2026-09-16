@@ -127,6 +127,12 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
+    /// The directory the agent last reported working in (via `pane.report_metadata`
+    /// `working_dir`, e.g. from a Claude PostToolUse hook). Preferred over the
+    /// OS-inspected foreground cwd when classifying whether the agent operates in
+    /// a linked worktree, because agents that keep their process cwd fixed still
+    /// report the directory they are editing.
+    pub reported_working_dir: Option<PathBuf>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
@@ -162,6 +168,7 @@ impl TerminalState {
             hook_authority: None,
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            reported_working_dir: None,
             persisted_agent_session: None,
             terminal_title: None,
             manual_label: None,
