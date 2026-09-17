@@ -14,6 +14,22 @@ use super::config_edit::{
     is_matching_command_hook,
 };
 
+// Claude's documented SessionStart sources. Grok imports Claude hooks but uses
+// `new`/`load`; filter before it starts an unnecessary hook process.
+const SESSION_START_MATCHER: &str = "^(startup|resume|clear|compact|fork)$";
+
+/// The `matcher` a hook entry for the given asset action is written with, kept
+/// in lockstep with the `matcher` [`ensure_command_hook`] records in the desired
+/// value so an insert round-trips through [`verify_updated`]. SessionStart hooks
+/// are scoped to Claude's documented session sources; the PostToolUse `workdir`
+/// hook must fire for every tool, so it uses the wildcard matcher.
+fn hook_matcher(action: &str) -> &'static str {
+    match action {
+        "workdir" => "*",
+        _ => SESSION_START_MATCHER,
+    }
+}
+
 struct HookRemoval {
     event: &'static str,
     actions: &'static [&'static str],
@@ -94,7 +110,7 @@ pub(crate) fn install(content: &str, settings_path: &Path, hook_path: &Path) -> 
         "SessionStart",
         hook_command(hook_path, Some("session")),
         10,
-        Some("*"),
+        Some(SESSION_START_MATCHER),
     )?;
 
     let with_session = if desired == original {
@@ -395,7 +411,7 @@ fn removal_commands(policy: &HookRemoval, hook_path: &Path) -> Vec<String> {
 
 fn canonical_hook_value(hook_path: &Path) -> Value {
     serde_json_value!({
-        "matcher": "*",
+        "matcher": SESSION_START_MATCHER,
         "hooks": [{
             "type": "command",
             "command": hook_command(hook_path, Some("session")),
@@ -410,8 +426,9 @@ fn canonical_hook_input(hook_path: &Path) -> CstInputValue {
 
 fn hook_entry_input(hook_path: &Path, action: &str) -> CstInputValue {
     let command = hook_command(hook_path, Some(action));
+    let matcher = hook_matcher(action);
     json!({
-        matcher: "*",
+        matcher: matcher,
         hooks: [{
             "type": "command",
             command: command,
@@ -576,8 +593,9 @@ fn canonical_hook_json(hook_path: &Path) -> io::Result<String> {
 /// the given asset action, matching the shape [`ensure_command_hook`] appends.
 fn hook_entry_json(hook_path: &Path, action: &str) -> io::Result<String> {
     let command = serde_json::to_string(&hook_command(hook_path, Some(action)))?;
+    let matcher = hook_matcher(action);
     Ok(format!(
-        "{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":{command},\"timeout\":10}}]}}"
+        "{{\"matcher\":\"{matcher}\",\"hooks\":[{{\"type\":\"command\",\"command\":{command},\"timeout\":10}}]}}"
     ))
 }
 
@@ -850,17 +868,68 @@ mod tests {
     }
 
     #[test]
+    fn install_scopes_claude_session_start_sources() {
+        let (settings_path, hook_path) = paths();
+        let installed = install("{}", settings_path, hook_path).unwrap();
+        let settings: Value = serde_json::from_str(&installed).unwrap();
+        let matcher = settings["hooks"]["SessionStart"][0]["matcher"]
+            .as_str()
+            .unwrap();
+        assert_eq!(matcher, "^(startup|resume|clear|compact|fork)$");
+        let pattern = regex::Regex::new(matcher).unwrap();
+        for source in ["startup", "resume", "clear", "compact", "fork"] {
+            assert!(pattern.is_match(source), "Claude source: {source}");
+        }
+        for source in ["new", "load", "", "future-source", "startup-extra"] {
+            assert!(!pattern.is_match(source), "non-Claude source: {source}");
+        }
+    }
+
+    #[test]
     fn install_is_a_byte_exact_noop_for_a_canonical_hook() {
         let (settings_path, hook_path) = paths();
         let command = serde_json::to_string(&hook_command(hook_path, Some("session"))).unwrap();
         let workdir = serde_json::to_string(&hook_command(hook_path, Some("workdir"))).unwrap();
         let input = format!(
-            "{{\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"timeout\":10,\"command\":{command},\"type\":\"command\"}}],\"matcher\":\"*\"}}],\"PostToolUse\":[{{\"hooks\":[{{\"command\":{workdir},\"type\":\"command\"}}],\"matcher\":\"x\"}}]}},\"escaped\":\"\\u0061\"}}  \r\n\r\n"
+            "{{\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"timeout\":10,\"command\":{command},\"type\":\"command\"}}],\"matcher\":\"{SESSION_START_MATCHER}\"}}],\"PostToolUse\":[{{\"hooks\":[{{\"command\":{workdir},\"type\":\"command\"}}],\"matcher\":\"x\"}}]}},\"escaped\":\"\\u0061\"}}  \r\n\r\n"
         );
 
         let updated = install(&input, settings_path, hook_path).unwrap();
 
         assert_eq!(updated, input);
+    }
+
+    #[test]
+    fn install_migrates_wildcard_session_start_and_preserves_user_hook() {
+        let (settings_path, hook_path) = paths();
+        let command = serde_json::to_string(&hook_command(hook_path, Some("session"))).unwrap();
+        let user_hook = r#"{ "type" : "command", "command" : "echo keep", "timeout" : 3 }"#;
+        let input = format!(
+            "{{\n  \"hooks\": {{\n    \"SessionStart\": [{{\"matcher\":\"*\",\"hooks\":[{{\"type\":\"command\",\"command\":{command},\"timeout\":10}},{user_hook}]}}]\n  }}\n}}\n\n"
+        );
+        let installed = install(&input, settings_path, hook_path).unwrap();
+        assert!(installed.contains(user_hook));
+        assert!(installed.ends_with("}\n\n"));
+        let settings: Value = serde_json::from_str(&installed).unwrap();
+        let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["matcher"], "*");
+        assert_eq!(groups[0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(groups[0]["hooks"][0]["command"], "echo keep");
+        assert_eq!(groups[1], canonical_hook_value(hook_path));
+        assert_eq!(
+            install(&installed, settings_path, hook_path).unwrap(),
+            installed
+        );
+
+        let removed = uninstall(&installed, settings_path, hook_path).unwrap();
+        assert!(removed.contains(user_hook));
+        assert!(!removed.contains(&command));
+        let settings: Value = serde_json::from_str(&removed).unwrap();
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[test]

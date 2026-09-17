@@ -385,7 +385,9 @@ pub(crate) fn render_sidebar(
             break;
         }
         let rect = Rect::new(body.x, y, content_width, row_height);
-        let selected = state.selected_workspace_id == Some(workspace.workspace_id.as_str());
+        let selected = state.selected_workspace_id.is_some_and(|target| {
+            target.matches(state.active_endpoint_id, &workspace.workspace_id)
+        });
         let dragged = state.dragged_workspace_id == Some(workspace.workspace_id.as_str());
         if selected {
             buffer.set_style(rect, Style::default().bg(palette.selection_bg));
@@ -409,22 +411,14 @@ pub(crate) fn render_sidebar(
             state.hover,
             &mut hits.hover_tooltips,
         );
-        let group_toggle = parent_group_key(snapshot, entry.index).map(|key| {
-            let rect = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
-            put_text(
-                buffer,
-                rect.x,
-                rect.y,
-                rect.width,
-                if state.collapsed_groups.contains(&key) {
-                    "▸"
-                } else {
-                    "▾"
-                },
-                Style::default().fg(palette.accent),
-            );
-            (rect, key)
-        });
+        let group_toggle = render_parent_group_toggle(
+            buffer,
+            rect,
+            snapshot,
+            entry.index,
+            state.collapsed_groups,
+            palette,
+        );
         hits.workspaces.push(WorkspaceHit {
             rect,
             endpoint_id: ClientEndpointId::Local,
@@ -628,7 +622,7 @@ pub(crate) fn workspace_entries(
     entries
 }
 
-pub(super) fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<String> {
+fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> Option<String> {
     let workspace = snapshot.workspaces.get(index)?;
     let worktree = workspace.worktree.as_ref()?;
     if worktree.is_linked_worktree {
@@ -648,7 +642,37 @@ pub(super) fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> 
         .then(|| worktree.key.clone())
 }
 
-pub(super) fn displayed_workspace_status(
+pub(in crate::client::shell) fn render_parent_group_toggle(
+    buffer: &mut Buffer,
+    workspace_rect: Rect,
+    snapshot: &ClientShellSnapshot,
+    workspace_index: usize,
+    collapsed_groups: &HashSet<String>,
+    palette: &Palette,
+) -> Option<(Rect, String)> {
+    let key = parent_group_key(snapshot, workspace_index)?;
+    let toggle = Rect::new(
+        workspace_rect.right().saturating_sub(1),
+        workspace_rect.y,
+        1,
+        1,
+    );
+    put_text(
+        buffer,
+        toggle.x,
+        toggle.y,
+        toggle.width,
+        if collapsed_groups.contains(&key) {
+            "▸"
+        } else {
+            "▾"
+        },
+        Style::default().fg(palette.accent),
+    );
+    Some((toggle, key))
+}
+
+pub(in crate::client::shell) fn displayed_workspace_status(
     snapshot: &ClientShellSnapshot,
     workspace: &ClientShellWorkspace,
     collapsed_groups: &HashSet<String>,
@@ -769,9 +793,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         status_icon(status, indicators),
         Style::default().fg(status_color(status, palette)),
     );
-    let state_text_style = Style::default()
-        .fg(status_color(status, palette))
-        .add_modifier(Modifier::DIM);
+    let state_text_style = Style::default().fg(status_color(status, palette));
     let custom_style = Style::default().fg(palette.overlay1);
     for (row_index, row) in rows.iter().enumerate() {
         let y = area.y + row_index as u16;
