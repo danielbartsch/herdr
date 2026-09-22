@@ -546,6 +546,8 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_in_linked_worktree: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,

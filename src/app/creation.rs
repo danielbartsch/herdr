@@ -356,6 +356,7 @@ impl App {
                 .map(|cwd| cwd.display().to_string()),
             foreground_cwd: foreground_cwd.as_ref().map(|cwd| cwd.display().to_string()),
             foreground_in_linked_worktree,
+            restore_error: terminal.restore_error.clone(),
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),
             title: presentation.title,
