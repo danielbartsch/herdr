@@ -250,12 +250,14 @@ fn surface_with_popup() -> PaneSurfaceFrame {
 mod agents_worktrees_notifications;
 mod background_status;
 mod chrome_context;
+mod close_pane;
 mod close_tab;
 mod copy;
 mod endpoint_requests;
 mod endpoints;
 mod graphics;
 mod hover_tooltips;
+mod input_conformance;
 #[path = "input.rs"]
 mod input_domain;
 mod keybindings_settings;
